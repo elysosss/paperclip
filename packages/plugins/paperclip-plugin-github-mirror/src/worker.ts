@@ -7,10 +7,11 @@ import {
 } from "@paperclipai/plugin-sdk";
 import type { IssueStatus } from "@paperclipai/shared";
 import { GithubApiError, GithubClient } from "./github.js";
-import { STATE_KEYS } from "./constants.js";
+import { ESCALATION_EVENT, STATE_KEYS } from "./constants.js";
 import {
   formatBody,
   formatBudgetComment,
+  formatEscalationNotice,
   formatRunFailureComment,
   formatStatusComment,
   formatTitle,
@@ -114,15 +115,22 @@ const plugin = definePlugin({
     };
 
     /** Posts a comment on the mirrored issue, if there is one. */
-    const comment = async (event: PluginEvent, body: string): Promise<void> => {
-      const issueId = event.entityId;
-      if (!issueId) return;
-      const config = await readConfig(ctx, event.companyId);
+    const commentOnIssue = async (
+      issueId: string,
+      companyId: string,
+      body: string,
+    ): Promise<void> => {
+      const config = await readConfig(ctx, companyId);
       if (!config) return;
       const number = await readMirroredNumber(ctx, issueId);
       if (!number) return;
-      const github = await clientFor(ctx, event.companyId, config);
+      const github = await clientFor(ctx, companyId, config);
       await github.addComment(number, body);
+    };
+
+    const comment = async (event: PluginEvent, body: string): Promise<void> => {
+      if (!event.entityId) return;
+      await commentOnIssue(event.entityId, event.companyId, body);
     };
 
     ctx.events.on("issue.created", (event) =>
@@ -193,6 +201,29 @@ const plugin = definePlugin({
 
     ctx.events.on("budget.incident.resolved", (event) =>
       guard(ctx, "budget.incident.resolved", () => comment(event, formatBudgetComment("resolved"))),
+    );
+
+    // Plugin-to-plugin: the escalation plugin decides, the mirror only shows it.
+    // The issue id travels in the payload, since a plugin-emitted event has no entity.
+    ctx.events.on(ESCALATION_EVENT, (event) =>
+      guard(ctx, ESCALATION_EVENT, async () => {
+        const payload = (event.payload ?? {}) as {
+          issueId?: string;
+          reviewReturns?: number;
+          gateFailures?: number;
+          threshold?: number;
+        };
+        if (!payload.issueId) return;
+        await commentOnIssue(
+          payload.issueId,
+          event.companyId,
+          formatEscalationNotice({
+            reviewReturns: payload.reviewReturns ?? 0,
+            gateFailures: payload.gateFailures ?? 0,
+            threshold: payload.threshold ?? 0,
+          }),
+        );
+      }),
     );
 
     ctx.logger.info("GitHub mirror ready");

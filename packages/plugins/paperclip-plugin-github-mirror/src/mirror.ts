@@ -53,6 +53,24 @@ export function formatRunFailureComment(input: {
 }
 
 /**
+ * Raised by the escalation plugin, not by this one — the mirror only renders it.
+ * Keeping the trigger in the other plugin means the viewing surface knows nothing
+ * about the escalation rules.
+ */
+export function formatEscalationNotice(input: {
+  reviewReturns: number;
+  gateFailures: number;
+  threshold: number;
+}): string {
+  return [
+    `⚠️ **Escalated after ${input.reviewReturns} review round(s)** (threshold ${input.threshold}).`,
+    "",
+    `Automated gate failures on this task: ${input.gateFailures}.`,
+    "This task now needs a human; it is parked rather than retried again.",
+  ].join("\n");
+}
+
+/**
  * Budget stops are a valid observable state ("found it but did not ship it"),
  * not a failure — the wording deliberately reflects that.
  */

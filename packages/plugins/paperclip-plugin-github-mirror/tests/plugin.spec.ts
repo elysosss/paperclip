@@ -21,7 +21,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     projectWorkspaceId: null,
     goalId: null,
     parentId: null,
-    workMode: "single_run",
+    workMode: "standard",
     priority: "medium",
     assigneeAgentId: null,
     assigneeUserId: null,
@@ -228,6 +228,22 @@ describe("mirror behaviour", () => {
 
     const comment = fetcher.calls.find((c) => c.url.endsWith("/comments"));
     expect((comment?.body as { body: string }).body).toContain("Agent run failed");
+  });
+
+  it("renders an escalation raised by the escalation plugin", async () => {
+    const { harness, fetcher } = await setupHarness();
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+
+    // Emitted by the escalation plugin; the issue id travels in the payload.
+    await harness.emit(
+      "plugin.paperclip-plugin-escalation.escalation-raised",
+      { issueId: "iss_1", reviewReturns: 3, gateFailures: 1, threshold: 3 },
+      { companyId: COMPANY_ID },
+    );
+
+    const comment = fetcher.calls.find((c) => c.url.endsWith("/comments"));
+    expect((comment?.body as { body: string }).body).toContain("Escalated after 3 review round(s)");
+    expect((comment?.body as { body: string }).body).toContain("needs a human");
   });
 
   it("reports a budget stop as a pause, not a failure", async () => {

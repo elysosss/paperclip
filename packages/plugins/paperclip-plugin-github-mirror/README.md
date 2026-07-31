@@ -14,6 +14,10 @@ back — comments and edits made on the GitHub side are not synced anywhere.
 | `issue.updated` | Only on an actual status change: updates title/body/label and comments the transition. Terminal states (`done`, `cancelled`) close the issue |
 | `agent.run.failed` | Comments the failure, with the run id and truncated error |
 | `budget.incident.opened` / `.resolved` | Comments a pause / resume — a budget stop is a valid observable state, not a failure |
+| `escalation-raised` (from the escalation plugin) | Comments that the task was escalated and needs a human |
+
+The escalation entry is plugin-to-plugin: the escalation plugin decides *when* a task needs a
+human, this one only renders it. The mirror holds no escalation logic of its own.
 
 An issue created before the mirror was configured is picked up on its next status change.
 

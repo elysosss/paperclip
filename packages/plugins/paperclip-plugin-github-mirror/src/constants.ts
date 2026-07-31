@@ -9,6 +9,12 @@ export const STATE_KEYS = {
   lastStatus: "last-mirrored-status",
 } as const;
 
+/**
+ * Emitted by the escalation plugin when a task is handed to a human. Subscribed to
+ * rather than reimplemented, so escalation policy stays in one place.
+ */
+export const ESCALATION_EVENT = "plugin.paperclip-plugin-escalation.escalation-raised";
+
 /** Marker appended to every mirrored body so a human can tell what created it. */
 export const MIRROR_FOOTER =
   "_Mirrored from Paperclip. This issue is written by the mirror; edits here are not read back._";
