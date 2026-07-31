@@ -30,10 +30,15 @@ const manifest: PaperclipPluginManifestV1 = {
         description: 'Where task state is mirrored, as "owner/repo".',
       },
       token: {
-        type: "string",
-        title: "GitHub token (secret reference)",
+        // `format: secret-ref` is only a UI hint — the host registers it as a
+        // no-op format — so the type must still admit the
+        // { type: "secret_ref", secretId } object a secret picker submits,
+        // not just a plain string.
+        type: ["string", "object"],
+        format: "secret-ref",
+        title: "GitHub token",
         description:
-          "Secret reference to a token with issues:write on the target repository. Resolved per call, never stored by the plugin.",
+          "Token with issues:write on the target repository. Resolved per call, never stored by the plugin.",
       },
       mirrorEnabled: {
         type: "boolean",
