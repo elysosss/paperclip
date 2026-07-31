@@ -913,7 +913,11 @@ export async function startServer(): Promise<StartedServer> {
   };
 
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const heartbeat = heartbeatService(db as any, {
+      pluginWorkerManager,
+      companyMaxConcurrentRuns: config.companyMaxConcurrentRuns,
+      mentionedSkillInjectionEnabled: config.mentionedSkillInjectionEnabled,
+    });
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });

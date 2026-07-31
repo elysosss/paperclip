@@ -69,6 +69,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { companyHasFreeWipSlot, normalizeCompanyWipLimit } from "./company-wip-limit.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -6106,6 +6107,17 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /**
+   * Company-wide cap on concurrently running runs, across all of a company's
+   * agents. 0 (the default) disables it and keeps per-agent limits as the only
+   * constraint. See `company-wip-limit.ts`.
+   */
+  companyMaxConcurrentRuns?: number;
+  /**
+   * Whether mentioning a skill in issue text may force it into a run, bypassing
+   * the agent's configured skills. Defaults to true (upstream behaviour).
+   */
+  mentionedSkillInjectionEnabled?: boolean;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -6134,6 +6146,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
   const runtimeEnv = options.runtimeEnv ?? process.env;
+  const companyMaxConcurrentRuns = normalizeCompanyWipLimit(options.companyMaxConcurrentRuns);
+  const mentionedSkillInjectionEnabled = options.mentionedSkillInjectionEnabled !== false;
   const inWorktreeRuntime = isTruthyRuntimeEnvValue(runtimeEnv.PAPERCLIP_IN_WORKTREE);
   // Preview worktree instances suppress the run engine by default. Users can lift
   // that per-worktree via the `enableWorktreeRunExecution` experimental setting
@@ -12475,6 +12489,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
+      // Company-wide serial limit; disabled unless configured. See company-wip-limit.ts.
+      if (!(await companyHasFreeWipSlot({ db, companyId: agent.companyId, limit: companyMaxConcurrentRuns }))) {
+        return [];
+      }
+
       const queuedRuns = await db
         .select()
         .from(heartbeatRuns)
@@ -13086,11 +13105,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : selectedEnvironmentId
         ? await environmentsSvc.getById(selectedEnvironmentId)
         : null;
-    const runScopedMentionedSkillKeys = await resolveRunScopedMentionedSkillKeys({
-      db,
-      companyId: agent.companyId,
-      issueId,
-    });
+    // Mentioning a skill in issue text force-injects it, bypassing the agent's own
+    // skill configuration. Deployments that source skills from a single external
+    // layer can turn that bypass off; upstream behaviour is the default.
+    const runScopedMentionedSkillKeys = mentionedSkillInjectionEnabled
+      ? await resolveRunScopedMentionedSkillKeys({
+          db,
+          companyId: agent.companyId,
+          issueId,
+        })
+      : [];
     const pushCapabilityPreflightRequired = requiresPushCapabilityPreflight({
       adapterType: agent.adapterType,
       issueId,

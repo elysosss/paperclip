@@ -1,4 +1,5 @@
 import { readConfigFile } from "./config-file.js";
+import { normalizeCompanyWipLimit } from "./services/company-wip-limit.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
@@ -85,6 +86,10 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  /** Company-wide cap on concurrently running runs. 0 disables the cap. */
+  companyMaxConcurrentRuns: number;
+  /** Allow issue-text skill mentions to force skills into a run. */
+  mentionedSkillInjectionEnabled: boolean;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
 }
@@ -331,6 +336,8 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    companyMaxConcurrentRuns: normalizeCompanyWipLimit(process.env.COMPANY_MAX_CONCURRENT_RUNS),
+    mentionedSkillInjectionEnabled: process.env.MENTIONED_SKILL_INJECTION_ENABLED !== "false",
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
