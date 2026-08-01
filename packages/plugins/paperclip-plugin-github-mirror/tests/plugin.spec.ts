@@ -124,6 +124,20 @@ describe("github client", () => {
     expect(JSON.stringify(call.body)).not.toContain("t0ken");
   });
 
+  it("sends a User-Agent, which GitHub rejects the request without", async () => {
+    // Omitting it produces a 403 whose body talks about "administrative rules",
+    // which reads like a token permission problem and is not one.
+    const fetcher = stubFetch();
+    const client = new GithubClient({
+      repository: "acme/content",
+      token: "t0ken",
+      fetchImpl: fetcher.impl,
+    });
+    await client.createIssue({ title: "T", body: "B" });
+
+    expect(fetcher.calls[0]?.headers["user-agent"]).toBeTruthy();
+  });
+
   it("flags rate limiting as retryable and a bad request as not", async () => {
     const make = (status: number, headers: Record<string, string> = {}) =>
       new GithubClient({

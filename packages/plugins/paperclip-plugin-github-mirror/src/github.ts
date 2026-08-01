@@ -21,6 +21,7 @@ export interface GithubIssueRef {
 }
 
 const DEFAULT_API_BASE = "https://api.github.com";
+const USER_AGENT = "paperclip-plugin-github-mirror";
 
 export class GithubApiError extends Error {
   constructor(
@@ -62,6 +63,9 @@ export class GithubClient {
         accept: "application/vnd.github+json",
         "content-type": "application/json",
         "x-github-api-version": "2022-11-28",
+        // GitHub rejects requests without a User-Agent with a 403 that reads
+        // like a permissions failure, so this is required, not cosmetic.
+        "user-agent": USER_AGENT,
         authorization: `Bearer ${this.options.token}`,
         ...(init.headers ?? {}),
       },
