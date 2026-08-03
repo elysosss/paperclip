@@ -169,8 +169,8 @@ describe("escalation behaviour", () => {
     for (let i = 0; i < 5; i += 1) {
       await harness.emit(
         "agent.run.failed",
-        { runId: "r" },
-        { entityId: ISSUE_ID, companyId: COMPANY_ID },
+        { runId: `run_${i}`, issueId: ISSUE_ID },
+        { entityId: `run_${i}`, companyId: COMPANY_ID },
       );
     }
 

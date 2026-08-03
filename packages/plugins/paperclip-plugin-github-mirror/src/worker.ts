@@ -181,9 +181,17 @@ const plugin = definePlugin({
 
     ctx.events.on("agent.run.failed", (event) =>
       guard(ctx, "agent.run.failed", async () => {
-        const payload = (event.payload ?? {}) as { runId?: string; error?: string; message?: string };
-        await comment(
-          event,
+        const payload = (event.payload ?? {}) as {
+          runId?: string;
+          issueId?: unknown;
+          error?: string;
+          message?: string;
+        };
+        const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
+        if (!issueId) return;
+        await commentOnIssue(
+          issueId,
+          event.companyId,
           formatRunFailureComment({
             runId: payload.runId,
             message: payload.error ?? payload.message,

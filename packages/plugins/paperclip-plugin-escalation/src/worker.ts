@@ -136,7 +136,8 @@ const plugin = definePlugin({
     // test is objective and worth retrying, unlike a repeated reviewer disagreement.
     ctx.events.on("agent.run.failed", (event) =>
       guard(ctx, "agent.run.failed", async () => {
-        const issueId = event.entityId;
+        const payload = (event.payload ?? {}) as { issueId?: unknown };
+        const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
         if (!issueId) return;
         if (!(await readConfig(ctx, event.companyId))) return;
         const next = (await readNumber(ctx, issueId, STATE_KEYS.gateFailures)) + 1;

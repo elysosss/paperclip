@@ -230,14 +230,18 @@ describe("mirror behaviour", () => {
     const { harness, fetcher } = await setupHarness();
 
     // Nothing mirrored yet -> no comment attempt.
-    await harness.emit("agent.run.failed", { runId: "r1" }, { entityId: "iss_1", companyId: COMPANY_ID });
+    await harness.emit(
+      "agent.run.failed",
+      { runId: "run_1", issueId: "iss_1" },
+      { entityId: "run_1", companyId: COMPANY_ID },
+    );
     expect(fetcher.calls).toHaveLength(0);
 
     await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
     await harness.emit(
       "agent.run.failed",
-      { runId: "r1", error: "boom" },
-      { entityId: "iss_1", companyId: COMPANY_ID },
+      { runId: "run_1", issueId: "iss_1", error: "boom" },
+      { entityId: "run_1", companyId: COMPANY_ID },
     );
 
     const comment = fetcher.calls.find((c) => c.url.endsWith("/comments"));
