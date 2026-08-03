@@ -57,6 +57,23 @@ async function guard(ctx: PluginContext, what: string, run: () => Promise<void>)
 
 const plugin = definePlugin({
   async setup(ctx) {
+    const pendingIssueUpdates = new Map<string, Promise<void>>();
+
+    /**
+     * Delivery can overlap for one task. Keep the read-modify-write escalation
+     * transition in order so concurrent reviewer returns cannot escalate twice.
+     */
+    const serializeIssueUpdate = async (key: string, run: () => Promise<void>): Promise<void> => {
+      const previous = pendingIssueUpdates.get(key) ?? Promise.resolve();
+      const next = previous.catch(() => undefined).then(run);
+      pendingIssueUpdates.set(key, next);
+      try {
+        await next;
+      } finally {
+        if (pendingIssueUpdates.get(key) === next) pendingIssueUpdates.delete(key);
+      }
+    };
+
     /** Parks the task for a human and tells other plugins about it. */
     const escalate = async (
       event: PluginEvent,
@@ -94,41 +111,43 @@ const plugin = definePlugin({
       guard(ctx, "issue.updated", async () => {
         const issueId = event.entityId;
         if (!issueId) return;
-        const config = await readConfig(ctx, event.companyId);
-        if (!config) return;
+        await serializeIssueUpdate(`${event.companyId}\u0000${issueId}`, async () => {
+          const config = await readConfig(ctx, event.companyId);
+          if (!config) return;
 
-        const issue = await ctx.issues.get(issueId, event.companyId);
-        if (!issue) return;
+          const issue = await ctx.issues.get(issueId, event.companyId);
+          if (!issue) return;
 
-        const stored = await ctx.state.get({ ...scope(issueId), stateKey: STATE_KEYS.lastStatus });
-        const previous = typeof stored === "string" ? (stored as IssueStatus) : null;
-        if (previous === issue.status) return;
+          const stored = await ctx.state.get({ ...scope(issueId), stateKey: STATE_KEYS.lastStatus });
+          const previous = typeof stored === "string" ? (stored as IssueStatus) : null;
+          if (previous === issue.status) return;
 
-        await ctx.state.set({ ...scope(issueId), stateKey: STATE_KEYS.lastStatus }, issue.status);
+          await ctx.state.set({ ...scope(issueId), stateKey: STATE_KEYS.lastStatus }, issue.status);
 
-        if (isTerminal(issue.status)) {
-          await clearCounters(ctx, issueId);
-          return;
-        }
+          if (isTerminal(issue.status)) {
+            await clearCounters(ctx, issueId);
+            return;
+          }
 
-        if (!isReviewReturn(previous, issue.status)) return;
+          if (!isReviewReturn(previous, issue.status)) return;
 
-        const alreadyEscalated = await ctx.state.get({
-          ...scope(issueId),
-          stateKey: STATE_KEYS.escalated,
+          const alreadyEscalated = await ctx.state.get({
+            ...scope(issueId),
+            stateKey: STATE_KEYS.escalated,
+          });
+          if (alreadyEscalated === true) return;
+
+          const reviewReturns = (await readNumber(ctx, issueId, STATE_KEYS.reviewReturns)) + 1;
+          await ctx.state.set({ ...scope(issueId), stateKey: STATE_KEYS.reviewReturns }, reviewReturns);
+
+          const counters: Counters = {
+            gateFailures: await readNumber(ctx, issueId, STATE_KEYS.gateFailures),
+            reviewReturns,
+          };
+          if (shouldEscalate(counters, config.reviewReturnThreshold)) {
+            await escalate(event, counters, config.reviewReturnThreshold);
+          }
         });
-        if (alreadyEscalated === true) return;
-
-        const reviewReturns = (await readNumber(ctx, issueId, STATE_KEYS.reviewReturns)) + 1;
-        await ctx.state.set({ ...scope(issueId), stateKey: STATE_KEYS.reviewReturns }, reviewReturns);
-
-        const counters: Counters = {
-          gateFailures: await readNumber(ctx, issueId, STATE_KEYS.gateFailures),
-          reviewReturns,
-        };
-        if (shouldEscalate(counters, config.reviewReturnThreshold)) {
-          await escalate(event, counters, config.reviewReturnThreshold);
-        }
       }),
     );
 

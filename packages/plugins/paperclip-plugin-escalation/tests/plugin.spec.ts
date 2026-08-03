@@ -147,6 +147,42 @@ describe("escalation behaviour", () => {
     expect(emitted).toHaveLength(1);
   });
 
+  it("serializes concurrent reviewer returns at the escalation threshold", async () => {
+    const { harness, comments, emitted } = await setup();
+    await harness.ctx.state.set(
+      { scopeKind: "issue", scopeId: ISSUE_ID, stateKey: STATE_KEYS.lastStatus },
+      "in_review",
+    );
+    await harness.ctx.state.set(
+      { scopeKind: "issue", scopeId: ISSUE_ID, stateKey: STATE_KEYS.reviewReturns },
+      2,
+    );
+
+    const originalUpdate = harness.ctx.issues.update;
+    let releaseUpdate: (() => void) | undefined;
+    let markUpdateStarted: (() => void) | undefined;
+    const updateStarted = new Promise<void>((resolve) => {
+      markUpdateStarted = resolve;
+    });
+    const updateMayFinish = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    harness.ctx.issues.update = (async (...args) => {
+      markUpdateStarted?.();
+      await updateMayFinish;
+      return originalUpdate(...args);
+    }) as typeof harness.ctx.issues.update;
+
+    const first = harness.emit("issue.updated", {}, { entityId: ISSUE_ID, companyId: COMPANY_ID });
+    await updateStarted;
+    const second = harness.emit("issue.updated", {}, { entityId: ISSUE_ID, companyId: COMPANY_ID });
+    releaseUpdate?.();
+    await Promise.all([first, second]);
+
+    expect(comments).toHaveLength(1);
+    expect(emitted).toHaveLength(1);
+  });
+
   it("respects a configured threshold", async () => {
     const { emitted, reviewerReturn } = await setup({ reviewReturnThreshold: 1 });
 
