@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - master
+      # The fork's maintained integration branch carries its own plugin work.
+      - fork/main
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
