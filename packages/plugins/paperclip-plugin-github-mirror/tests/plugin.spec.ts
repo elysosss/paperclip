@@ -178,6 +178,32 @@ describe("mirror behaviour", () => {
     expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(1);
   });
 
+  it("serializes concurrent create events for the same task", async () => {
+    const { harness, fetcher } = await setupHarness();
+    const originalFetch = harness.ctx.http.fetch;
+    let releaseCreate: (() => void) | undefined;
+    let markCreateStarted: (() => void) | undefined;
+    const createStarted = new Promise<void>((resolve) => {
+      markCreateStarted = resolve;
+    });
+    const createMayFinish = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    harness.ctx.http.fetch = (async (url, init) => {
+      markCreateStarted?.();
+      await createMayFinish;
+      return originalFetch(url, init);
+    }) as HttpFetch;
+
+    const first = harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+    await createStarted;
+    const second = harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+    releaseCreate?.();
+    await Promise.all([first, second]);
+
+    expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
   it("stays silent when the status has not changed", async () => {
     const { harness, fetcher } = await setupHarness();
     await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });

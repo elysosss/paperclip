@@ -82,35 +82,54 @@ async function guard(ctx: PluginContext, what: string, run: () => Promise<void>)
 
 const plugin = definePlugin({
   async setup(ctx) {
+    const pendingMirrors = new Map<string, Promise<void>>();
+
+    /**
+     * Events can be delivered concurrently. Serialize creation per company/issue
+     * so both handlers cannot observe an empty mirror state and create duplicates.
+     */
+    const serializeMirror = async (key: string, run: () => Promise<void>): Promise<void> => {
+      const previous = pendingMirrors.get(key) ?? Promise.resolve();
+      const next = previous.catch(() => undefined).then(run);
+      pendingMirrors.set(key, next);
+      try {
+        await next;
+      } finally {
+        if (pendingMirrors.get(key) === next) pendingMirrors.delete(key);
+      }
+    };
+
     /** Creates the GitHub issue once and remembers its number. Idempotent. */
     const ensureMirrored = async (event: PluginEvent): Promise<void> => {
       const issueId = event.entityId;
       if (!issueId) return;
-      const config = await readConfig(ctx, event.companyId);
-      if (!config) return;
-      if (await readMirroredNumber(ctx, issueId)) return;
+      await serializeMirror(`${event.companyId}\u0000${issueId}`, async () => {
+        const config = await readConfig(ctx, event.companyId);
+        if (!config) return;
+        if (await readMirroredNumber(ctx, issueId)) return;
 
-      const issue = await ctx.issues.get(issueId, event.companyId);
-      if (!issue) return;
+        const issue = await ctx.issues.get(issueId, event.companyId);
+        if (!issue) return;
 
-      const github = await clientFor(ctx, event.companyId, config);
-      const created = await github.createIssue({
-        title: formatTitle(issue),
-        body: formatBody(issue),
-        labels: [statusLabel(issue.status)],
-      });
+        const github = await clientFor(ctx, event.companyId, config);
+        const created = await github.createIssue({
+          title: formatTitle(issue),
+          body: formatBody(issue),
+          labels: [statusLabel(issue.status)],
+        });
 
-      await ctx.state.set(
-        { ...issueScope(issueId), stateKey: STATE_KEYS.mirroredNumber },
-        created.number,
-      );
-      await ctx.state.set(
-        { ...issueScope(issueId), stateKey: STATE_KEYS.lastStatus },
-        issue.status,
-      );
-      ctx.logger.info("Mirrored Paperclip issue to GitHub", {
-        issueId,
-        githubIssue: created.number,
+        await ctx.state.set(
+          { ...issueScope(issueId), stateKey: STATE_KEYS.mirroredNumber },
+          created.number,
+        );
+        await ctx.state.set(
+          { ...issueScope(issueId), stateKey: STATE_KEYS.lastStatus },
+          issue.status,
+        );
+        ctx.logger.info("Mirrored Paperclip issue to GitHub", {
+          issueId,
+          githubIssue: created.number,
+        });
       });
     };
 
