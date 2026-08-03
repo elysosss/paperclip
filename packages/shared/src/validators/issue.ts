@@ -12,6 +12,7 @@ import {
   ISSUE_COMMENT_METADATA_ROW_TYPES,
   ISSUE_COMMENT_PRESENTATION_KINDS,
   ISSUE_COMMENT_PRESENTATION_TONES,
+  ISSUE_COMMENT_PRESENTATION_DENSITIES,
   ISSUE_HARNESS_KINDS,
   ISSUE_MONITOR_SCHEDULED_BY,
   ISSUE_PRIORITIES,
@@ -112,6 +113,7 @@ const executionWorkspaceStrategySchema = z
     branchTemplate: z.string().optional().nullable(),
     worktreeParentDir: z.string().optional().nullable(),
     provisionCommand: z.string().optional().nullable(),
+    runtimeProvisionCommand: z.string().optional().nullable(),
     teardownCommand: z.string().optional().nullable(),
   })
   .strict();
@@ -150,6 +152,7 @@ function isAllowedTaskEgressCidr(cidr: string): boolean {
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
     mode: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional(),
+    sharedWorkspaceConcurrency: z.enum(["auto", "serialize", "allow"]).optional(),
     environmentId: z.string().uuid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),
@@ -248,6 +251,7 @@ export const issueExecutionPolicySchema = z.object({
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  maxReviewRounds: z.number().int().positive().max(50).optional().nullable().default(null),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
@@ -283,6 +287,7 @@ export const issueExecutionStateSchema = z.object({
   lastDecisionId: z.string().uuid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
+  changesRequestedCount: z.number().int().nonnegative().optional().default(0),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({
@@ -563,6 +568,7 @@ export const issueCommentPresentationSchema = z.object({
   tone: z.enum(ISSUE_COMMENT_PRESENTATION_TONES).default("neutral"),
   title: z.string().trim().min(1).max(160).nullable().optional(),
   detailsDefaultOpen: z.boolean().optional().default(false),
+  density: z.enum(ISSUE_COMMENT_PRESENTATION_DENSITIES).optional(),
 }).strict();
 
 export type IssueCommentPresentation = z.infer<typeof issueCommentPresentationSchema>;

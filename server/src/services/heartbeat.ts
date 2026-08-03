@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -68,8 +68,18 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { getStartupTraceContext } from "../instrumentation.js";
 import { logger } from "../middleware/logger.js";
 import { companyHasFreeWipSlot, normalizeCompanyWipLimit } from "./company-wip-limit.js";
+import {
+  createGitRemoteAuthProvider,
+  describeGitAuthFailure,
+  scrubGitCredentialText,
+  type GitRemoteAuthProvider,
+} from "./git-credentials.js";
+// Re-exported because heartbeat's workspace surface exposed the scrubber before the
+// git-credentials module became its canonical home; existing importers keep working.
+export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -120,6 +130,8 @@ import {
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
+  buildWorkspaceReadyMetadata,
+  buildWorkspaceReadyPresentation,
   cleanupExecutionWorkspaceArtifacts,
   ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
@@ -131,8 +143,13 @@ import {
   releaseRuntimeServicesForRun,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
+  type RuntimeServiceRef,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
+import {
+  readManagedWorktreeInstanceOwnership,
+  WORKTREE_INSTANCE_ROOT_METADATA_KEY,
+} from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
 import { projectService } from "./projects.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
@@ -177,6 +194,7 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -211,7 +229,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -263,6 +281,7 @@ import {
   touchHeartbeatRunRuntimeStatus,
 } from "./heartbeat-run-runtime-status.js";
 import {
+  findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
@@ -385,6 +404,27 @@ const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
+export const WORKSPACE_BUSY_RETRY_REASON = "workspace_busy";
+export const WORKSPACE_BUSY_RETRY_WAKE_REASON = "workspace_busy_retry";
+export const WORKSPACE_BUSY_ERROR_CODE = "workspace_busy";
+export const WORKSPACE_BUSY_RETRY_BASE_DELAY_MS = 60 * 1000;
+export const WORKSPACE_BUSY_RETRY_JITTER_MS = 60 * 1000;
+// A running run stops counting as a shared-workspace holder once it has been
+// silent this long. This is recovery's own "suspicious silence" bar for active
+// runs (scanSilentActiveRuns escalates such runs), so a zombie holder cannot
+// park other work on the workspace forever: it stops blocking here at the same
+// moment the recovery machinery starts treating it as stuck. A LIVE holder, in
+// contrast, never gets overtaken — a deferred run keeps rescheduling until the
+// workspace frees, because dispatching alongside a live holder is exactly the
+// concurrent-mutation failure this gate exists to prevent.
+export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+// Issue-level executionWorkspaceSettings.mode values that unambiguously opt an
+// issue's runs out of the shared project workspace, and therefore out of
+// shared-workspace serialization ("isolated" is the legacy alias
+// parseIssueExecutionWorkspaceSettings normalizes to isolated_workspace). Any
+// other value — including agent_default and an absent mode — may still resolve
+// to the shared workspace and counts as a holder.
+const ISOLATED_EXECUTION_WORKSPACE_MODES = ["isolated_workspace", "operator_branch", "isolated"] as const;
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -420,6 +460,68 @@ export class ConfigurationIncompleteFailure extends Error {
     this.name = "ConfigurationIncompleteFailure";
     this.resultJson = resultJson;
   }
+}
+
+export interface SharedWorkspaceHolder {
+  runId: string;
+  agentId: string;
+  issueId: string;
+  issueIdentifier: string | null;
+}
+
+// Pre-dispatch gate outcome: another running run currently holds the issue's
+// shared project workspace. Not a failure — the run is parked as a bounded
+// scheduled retry and re-attempted once the holder finishes, so two agents
+// never mutate the same working tree concurrently.
+export class WorkspaceBusyDeferral extends Error {
+  code = WORKSPACE_BUSY_ERROR_CODE;
+  holder: SharedWorkspaceHolder;
+  projectWorkspaceId: string;
+  deferralAttempt: number;
+  wasIssueAssignee: boolean;
+
+  constructor(input: {
+    holder: SharedWorkspaceHolder;
+    projectWorkspaceId: string;
+    deferralAttempt: number;
+    wasIssueAssignee: boolean;
+  }) {
+    super(
+      `Shared project workspace is busy: run ${input.holder.runId} (issue ${
+        input.holder.issueIdentifier ?? input.holder.issueId
+      }) is still running`,
+    );
+    this.name = "WorkspaceBusyDeferral";
+    this.holder = input.holder;
+    this.projectWorkspaceId = input.projectWorkspaceId;
+    this.deferralAttempt = input.deferralAttempt;
+    this.wasIssueAssignee = input.wasIssueAssignee;
+  }
+}
+
+function isWorkspaceBusyDeferral(error: unknown): error is WorkspaceBusyDeferral {
+  return error instanceof WorkspaceBusyDeferral;
+}
+
+export function computeWorkspaceBusyRetryDelayMs(random: () => number = Math.random) {
+  const jitter = Math.min(Math.max(random(), 0), 1);
+  return WORKSPACE_BUSY_RETRY_BASE_DELAY_MS + Math.floor(jitter * WORKSPACE_BUSY_RETRY_JITTER_MS);
+}
+
+// True for the retry of a workspace-busy deferral whose original run did NOT
+// execute under assignee-ship (a comment or review-participant wake). For such
+// a retry an assignee mismatch is the expected state, so the reassignment
+// protections in the promotion gate and the claim-time staleness check must
+// not cancel it — cancelling would silently drop the wake the deferral
+// promised to replay.
+export function isNonAssigneeWorkspaceBusyRetry(
+  retryReason: string | null | undefined,
+  contextSnapshot: Record<string, unknown>,
+) {
+  return (
+    retryReason === WORKSPACE_BUSY_RETRY_REASON &&
+    contextSnapshot.workspaceBusyDeferredWhileAssignee === false
+  );
 }
 
 function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallbackMode {
@@ -544,6 +646,7 @@ function mergeAdapterRecoveryMetadata(input: {
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   "approval_approved",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  "issue_recovery_action_restored",
 ]);
 const ISSUE_RESPONSIBLE_USER_WAKE_REASONS = new Set([
   "issue_assigned",
@@ -701,6 +804,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   responsibleUserId?: string | null;
   environmentId?: string | null;
   environmentEnv?: unknown;
+  environmentDriver?: string | null;
   projectId?: string | null;
   routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
@@ -975,7 +1079,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
   // resolution so a per-agent OPENAI_API_KEY (plain or resolved secret) counts
   // as satisfying the credential. It shares the exact readiness predicate the
   // adapter uses at execute time, so the two cannot drift.
-  if ((input.adapterType ?? null) === "codex_local") {
+  //
+  // Sandbox-destined runs are exempt: the sandbox image may carry its own
+  // Codex login (`~/.codex/auth.json` baked in at image setup), which only the
+  // adapter can probe once the sandbox is up — and on managed cloud hosts a
+  // host-side login never exists at all. The adapter's execute-time gate
+  // remains the authority there; it probes the sandbox before failing.
+  if ((input.adapterType ?? null) === "codex_local" && (input.environmentDriver ?? null) !== "sandbox") {
     const resolvedEnv = parseObject(resolvedConfig.env);
     const readiness = await evaluateCodexCredentialReadiness({
       env: process.env,
@@ -1159,6 +1269,8 @@ export function applyPersistedExecutionWorkspaceConfig(input: {
     const nextStrategy = parseObject(nextConfig.workspaceStrategy);
     if (input.workspaceConfig.provisionCommand === null) delete nextStrategy.provisionCommand;
     else nextStrategy.provisionCommand = input.workspaceConfig.provisionCommand;
+    if (input.workspaceConfig.runtimeProvisionCommand === null) delete nextStrategy.runtimeProvisionCommand;
+    else nextStrategy.runtimeProvisionCommand = input.workspaceConfig.runtimeProvisionCommand;
     if (input.workspaceConfig.teardownCommand === null) delete nextStrategy.teardownCommand;
     else nextStrategy.teardownCommand = input.workspaceConfig.teardownCommand;
     nextConfig.workspaceStrategy = nextStrategy;
@@ -1234,6 +1346,8 @@ function buildExecutionWorkspaceConfigSnapshot(
 
   if ("workspaceStrategy" in config) {
     snapshot.provisionCommand = typeof strategy.provisionCommand === "string" ? strategy.provisionCommand : null;
+    snapshot.runtimeProvisionCommand =
+      typeof strategy.runtimeProvisionCommand === "string" ? strategy.runtimeProvisionCommand : null;
     snapshot.teardownCommand = typeof strategy.teardownCommand === "string" ? strategy.teardownCommand : null;
   }
 
@@ -1275,10 +1389,14 @@ export function stripHostWorkspaceProvisionForLowTrustSandbox(input: {
   if (input.selectedEnvironmentDriver !== "sandbox") return input.config;
 
   const workspaceStrategy = parseObject(input.config.workspaceStrategy);
-  if (typeof workspaceStrategy.provisionCommand !== "string") return input.config;
+  if (
+    typeof workspaceStrategy.provisionCommand !== "string"
+    && typeof workspaceStrategy.runtimeProvisionCommand !== "string"
+  ) return input.config;
 
   const nextWorkspaceStrategy = { ...workspaceStrategy };
   delete nextWorkspaceStrategy.provisionCommand;
+  delete nextWorkspaceStrategy.runtimeProvisionCommand;
 
   return {
     ...input.config,
@@ -1352,16 +1470,42 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
   }
 }
 
-async function ensureManagedProjectWorkspace(input: {
+/**
+ * In-flight managed-checkout materializations keyed by target cwd. Two issues on the same
+ * project can wake within seconds of each other; without this, both runs raced the same
+ * clone target — the loser saw "destination path already exists" and its failure cleanup
+ * deleted the winner's in-progress clone, so both runs failed every round.
+ */
+const managedCheckoutMaterializations = new Map<string, Promise<{ cwd: string; warning: string | null }>>();
+
+export async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
   repoUrl: string | null;
+  /** Optional git credential source for cloning private repos; null/absent preserves ambient behavior. */
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
   const cwd = resolveManagedProjectWorkspaceDir({
     companyId: input.companyId,
     projectId: input.projectId,
     repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
   });
+  const inFlight = managedCheckoutMaterializations.get(cwd);
+  if (inFlight) return inFlight;
+  const attempt = materializeManagedProjectWorkspace(cwd, input).finally(() => {
+    managedCheckoutMaterializations.delete(cwd);
+  });
+  managedCheckoutMaterializations.set(cwd, attempt);
+  return attempt;
+}
+
+async function materializeManagedProjectWorkspace(
+  cwd: string,
+  input: {
+    repoUrl: string | null;
+    resolveGitAuth?: GitRemoteAuthProvider | null;
+  },
+): Promise<{ cwd: string; warning: string | null }> {
   await fs.mkdir(path.dirname(cwd), { recursive: true });
   const stats = await fs.stat(cwd).catch(() => null);
 
@@ -1372,11 +1516,12 @@ async function ensureManagedProjectWorkspace(input: {
     return { cwd, warning: null };
   }
 
-  const gitDirExists = await fs
-    .stat(path.resolve(cwd, ".git"))
-    .then((entry) => entry.isDirectory())
-    .catch(() => false);
-  if (gitDirExists) {
+  const hasAdoptableGitDir = () =>
+    fs
+      .stat(path.resolve(cwd, ".git"))
+      .then((entry) => entry.isDirectory())
+      .catch(() => false);
+  if (await hasAdoptableGitDir()) {
     return { cwd, warning: null };
   }
 
@@ -1391,16 +1536,50 @@ async function ensureManagedProjectWorkspace(input: {
     await fs.rm(cwd, { recursive: true, force: true });
   }
 
+  // Clone into a temp sibling, then move into place atomically. The shared target directory
+  // is never created in a partial state and never removed on failure, so a concurrent
+  // materialization (another process, or a run racing this one) can neither adopt a broken
+  // checkout nor lose its own completed one.
+  const auth = input.resolveGitAuth ? await input.resolveGitAuth(input.repoUrl) : null;
+  const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
+    await execFile("git", [...(auth?.configArgs ?? []), "clone", input.repoUrl, cloneTmpDir], {
+      env: {
+        // Spread order matters: the sanitizer strips PAPERCLIP_*, which would remove the
+        // credential-helper token env if it came first. GIT_TERMINAL_PROMPT=0 fails a
+        // credential-less private clone immediately instead of hanging on a prompt until
+        // the clone timeout.
+        ...sanitizeRuntimeServiceBaseEnv(process.env),
+        GIT_TERMINAL_PROMPT: "0",
+        ...(auth?.env ?? {}),
+      },
       timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
     });
-    return { cwd, warning: null };
   } catch (error) {
+    await fs.rm(cloneTmpDir, { recursive: true, force: true }).catch(() => undefined);
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+    const authNote = describeGitAuthFailure({
+      error: reason,
+      used: auth ? { source: auth.source, secretName: auth.secretName } : null,
+    });
+    throw new Error(scrubGitCredentialText(
+      `Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}${authNote ? ` ${authNote}` : ""}`,
+    ));
   }
+
+  try {
+    await fs.rename(cloneTmpDir, cwd);
+  } catch (renameError) {
+    await fs.rm(cloneTmpDir, { recursive: true, force: true }).catch(() => undefined);
+    // The target appearing between the emptiness check and the rename means another
+    // materialization won the race; adopt its checkout instead of failing the run.
+    if (await hasAdoptableGitDir()) {
+      return { cwd, warning: null };
+    }
+    const reason = renameError instanceof Error ? renameError.message : String(renameError);
+    throw new Error(`Failed to move managed checkout into place at "${cwd}": ${reason}`);
+  }
+  return { cwd, warning: null };
 }
 
 /**
@@ -1414,6 +1593,7 @@ async function resolveConfiguredOrManagedProjectCwd(input: {
   projectId: string;
   cwd: string | null;
   repoUrl: string | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
   const configuredCwd = readNonEmptyString(input.cwd);
   if (configuredCwd && configuredCwd !== REPO_ONLY_CWD_SENTINEL) {
@@ -1423,6 +1603,7 @@ async function resolveConfiguredOrManagedProjectCwd(input: {
     companyId: input.companyId,
     projectId: input.projectId,
     repoUrl: readNonEmptyString(input.repoUrl),
+    resolveGitAuth: input.resolveGitAuth ?? null,
   });
 }
 
@@ -1450,8 +1631,16 @@ function defaultAdditionalProjectWorkspaceDeps(db: Db): ResolveAdditionalProject
         .from(projectWorkspaces)
         .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, projectId)))
         .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id)),
-    resolveConfiguredOrManagedProjectCwd,
-    ensureManagedProjectWorkspace,
+    resolveConfiguredOrManagedProjectCwd: (input) =>
+      resolveConfiguredOrManagedProjectCwd({
+        ...input,
+        resolveGitAuth: input.resolveGitAuth ?? createGitRemoteAuthProvider(db, input.companyId),
+      }),
+    ensureManagedProjectWorkspace: (input) =>
+      ensureManagedProjectWorkspace({
+        ...input,
+        resolveGitAuth: input.resolveGitAuth ?? createGitRemoteAuthProvider(db, input.companyId),
+      }),
     // A realized workspace must hold real content. An empty directory gives the agent an empty
     // referenced workspace, so treat an empty directory the same as a missing one.
     directoryHasContents: async (cwd) => {
@@ -1667,6 +1856,15 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     executionWorkspacePreference?: string | null;
   } | null;
   base: ExecutionWorkspaceInput;
+  /**
+   * Anchor-resolution facts that `base` alone cannot express: whether the base cwd is the
+   * agent-home fallback despite the project having workspaces, and which materialization
+   * attempts failed on the way there. Absent means "not a fallback" (legacy callers).
+   */
+  anchor?: {
+    baseCwdFallback?: boolean;
+    materializationFailures?: WorkspaceMaterializationFailure[];
+  } | null;
 }) {
   if (!input.issue) return;
   if (
@@ -1712,10 +1910,38 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     );
   }
 
+  // Checked before isGitCheckout: when materialization failed and the base cwd is the
+  // agent-home fallback, a git checkout at that path would be an unrelated repository —
+  // proceeding would build worktrees off the wrong repo, and failing on the checkout probe
+  // would mask the real cause (for example a clone that could not authenticate). The reason
+  // is reserved for genuine materialization failures; a fallback with no failed attempt
+  // (a configured path that is simply unavailable) keeps its accurate reporting below.
+  const materializationFailures = input.anchor?.materializationFailures ?? [];
+  if (input.anchor?.baseCwdFallback && materializationFailures.length > 0) {
+    const failureDetail = `: ${materializationFailures[0].error.replace(/\s+/g, " ")}`;
+    fail(
+      "git_worktree_base_materialization_failed",
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but the project workspace checkout could not be prepared${failureDetail}. Repair the project workspace repository URL, clone access, or configured local cwd, then retry.`,
+      { baseCwdFallback: true, materializationFailures },
+    );
+  }
+
   if (!await isGitCheckout(input.base.baseCwd)) {
     fail(
       "git_worktree_base_not_git_checkout",
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+    );
+  }
+
+  // A fallback cwd that happens to be a git checkout is still not the configured project
+  // workspace — building worktrees there would target an unrelated repository. No
+  // materialization attempt failed here (that case failed above); the configured path is
+  // simply unavailable, so the message points at the path rather than clone access.
+  if (input.anchor?.baseCwdFallback) {
+    fail(
+      "git_worktree_base_fallback_not_project_workspace",
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but the configured project workspace path is not available and the fallback cwd "${input.base.baseCwd}" is not the project workspace checkout. Make the configured project workspace path available on this host, or repair the project workspace configuration, then retry.`,
+      { baseCwdFallback: true, materializationFailures },
     );
   }
 }
@@ -2252,6 +2478,19 @@ export type ResolvedAdditionalWorkspace = {
   repoRef: string | null;
 };
 
+/**
+ * One project-workspace materialization attempt that failed during anchor resolution — for
+ * example a managed `git clone` that could not authenticate against a private repository.
+ * Carried on {@link ResolvedWorkspaceForRun} so downstream validation can report the real
+ * cause instead of the fallback cwd's symptoms. `repoUrl` and `error` are scrubbed of URL
+ * userinfo credentials before they are stored.
+ */
+export type WorkspaceMaterializationFailure = {
+  projectWorkspaceId: string | null;
+  repoUrl: string | null;
+  error: string;
+};
+
 export type ResolvedWorkspaceForRun = {
   cwd: string;
   source: "project_primary" | "task_session" | "agent_home";
@@ -2266,6 +2505,15 @@ export type ResolvedWorkspaceForRun = {
     repoRef: string | null;
   }>;
   warnings: string[];
+  /**
+   * True when project workspaces exist for the run but none could be used, so `cwd` is the
+   * agent-home fallback rather than a configured or materialized project workspace path. The
+   * `source` stays `project_primary` in that case (session migration depends on it), so this
+   * flag is the only reliable fallback signal.
+   */
+  baseCwdFallback: boolean;
+  /** Failed materialization attempts behind {@link baseCwdFallback}; empty when every candidate resolved or none was attempted. */
+  materializationFailures: WorkspaceMaterializationFailure[];
   /**
    * Read-only referenced (mentioned) project workspaces for this run, one per authorized
    * additional project. The array is empty unless the multi-project workspace-sync flag is on
@@ -2286,6 +2534,47 @@ type ResolvedAnchorWorkspaceForRun = Omit<
   ResolvedWorkspaceForRun,
   "additionalWorkspaces" | "referencedProjectFailures"
 >;
+
+/**
+ * Assemble the run warnings for the agent-home fallback when a project has workspaces but none
+ * produced a usable cwd. Materialization failures (for example a failed managed clone) take
+ * priority over the generic "no local cwd configured" note, which previously masked them.
+ */
+export function buildAnchorFallbackWorkspaceNotes(input: {
+  fallbackCwd: string;
+  preferredWorkspaceWarning: string | null;
+  materializationFailures: WorkspaceMaterializationFailure[];
+  missingProjectCwds: string[];
+  hasConfiguredProjectCwd: boolean;
+}): string[] {
+  const warnings: string[] = [];
+  if (input.preferredWorkspaceWarning) {
+    warnings.push(input.preferredWorkspaceWarning);
+  }
+  if (input.materializationFailures.length > 0) {
+    const first = input.materializationFailures[0];
+    const extraFailureCount = input.materializationFailures.length - 1;
+    warnings.push(
+      extraFailureCount > 0
+        ? `Failed to prepare the project workspace checkout (${first.error}), and ${extraFailureCount} other candidate workspace(s) also failed. Using fallback workspace "${input.fallbackCwd}" for this run.`
+        : `Failed to prepare the project workspace checkout: ${first.error}. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  }
+  if (input.missingProjectCwds.length > 0) {
+    const firstMissing = input.missingProjectCwds[0];
+    const extraMissingCount = Math.max(0, input.missingProjectCwds.length - 1);
+    warnings.push(
+      extraMissingCount > 0
+        ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${input.fallbackCwd}" for this run.`
+        : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  } else if (input.materializationFailures.length === 0 && !input.hasConfiguredProjectCwd) {
+    warnings.push(
+      `Project workspace has no local cwd configured. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  }
+  return warnings;
+}
 
 /**
  * Build the plural workspace list that a run exposes to the agent through the
@@ -2374,6 +2663,41 @@ export function isMultiProjectWorkspaceSyncEnabled(
  */
 export function isRemoteExecutionEnvironmentDriver(driver: string | null | undefined): boolean {
   return driver === "ssh" || driver === "sandbox" || driver === "plugin";
+}
+
+/**
+ * Environment flag (kill-switch, default ON) that gates whether a *remote* run stages the
+ * referenced (mentioned) project set into the sandbox. This is a targeted rollback lever: it
+ * disables only the remote referenced-project path and never regresses the working local path.
+ * The master flag {@link MULTI_PROJECT_WORKSPACE_SYNC_ENV} is the blunt switch that kills both
+ * local and remote. The remote path runs when both the master flag and this remote flag are ON —
+ * the default state. An unset value resolves ON; an operator disables it with an explicit false
+ * value (`"false"`, `"0"`, `"off"`, `"no"`, or `""`). The OFF state fails closed: a remote run
+ * runs no referenced-project authorization or staging and reverts to the remote drop path.
+ */
+export const MULTI_PROJECT_WORKSPACE_SYNC_REMOTE_ENV =
+  "PAPERCLIP_MULTI_PROJECT_WORKSPACE_SYNC_REMOTE";
+
+export function isMultiProjectWorkspaceSyncRemoteEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  // Default ON: an unset value is not false, so the remote path is live unless an operator sets
+  // an explicit false value as the targeted kill switch (rollback path).
+  return !isFalsyRuntimeEnvValue(env[MULTI_PROJECT_WORKSPACE_SYNC_REMOTE_ENV]);
+}
+
+/**
+ * True when an environment driver stages a multi-source remote workspace through the confined
+ * sandbox/command runtime. Only the `sandbox` driver asserts per-project confinement on the
+ * staging path (`assertSyncOperationsConfined` in `sandbox-managed-runtime`). The `ssh` driver
+ * stages without that guard, and the `plugin` driver does not route through the confined command
+ * runtime in the workspace-realization step, so both keep dropping referenced projects. A `local`
+ * (or unknown) driver is not remote and never reaches this check. This gate is intentionally
+ * narrower than {@link isRemoteExecutionEnvironmentDriver}: it names the one transport that
+ * confines each staged referenced tree.
+ */
+export function isConfinedRemoteStagingDriver(driver: string | null | undefined): boolean {
+  return driver === "sandbox";
 }
 
 /**
@@ -2646,11 +2970,26 @@ export interface ResolveAdditionalRunWorkspacesOptions {
   maxCandidateEvaluations?: number;
   /**
    * True when the run executes on a non-local target (ssh, sandbox, or plugin). A referenced
-   * project realizes as a local directory only, and a remote target has no path yet to receive
-   * that tree, so a resolved cwd would not exist on the target. When true, the function skips
-   * referenced-project authorization and workspace work and returns no additional workspaces.
+   * project realizes as a local directory first. On a remote target that local tree reaches the
+   * agent only when a confined transport stages it into the sandbox and the remote flag is on
+   * (see `targetStagesConfined` and `remoteReferencedSyncEnabled`). Otherwise the run drops the
+   * whole referenced set and records it at the staging layer.
    */
   executionTargetIsRemote?: boolean;
+  /**
+   * True when the remote target stages each referenced tree through the confined sandbox/command
+   * runtime (the `sandbox` driver; see {@link isConfinedRemoteStagingDriver}). The gate opens the
+   * referenced-project path on a remote target only when this is true. The SSH transport and any
+   * unconfined transport keep dropping referenced projects. Ignored on a local target.
+   */
+  targetStagesConfined?: boolean;
+  /**
+   * The remote-only kill switch (default ON; see {@link isMultiProjectWorkspaceSyncRemoteEnabled}).
+   * When true, a confined remote target stages the referenced set. When false, a remote target
+   * fails closed: it runs no referenced-project authorization or staging and reverts to the remote
+   * drop path. Ignored on a local target.
+   */
+  remoteReferencedSyncEnabled?: boolean;
 }
 
 /**
@@ -2676,34 +3015,44 @@ export async function resolveAdditionalRunWorkspaces(
     return { additionalWorkspaces: [], warnings: [], failures: [] };
   }
 
-  // A referenced project realizes as a local directory only. A remote execution target (ssh,
-  // sandbox, or plugin) has no path yet to receive the referenced tree, so a resolved cwd would
-  // not exist on the target and the anchor-only remote sync never carries it across. Skip the
-  // referenced-project authorization and clone work on a remote target, so the run neither does
-  // work it must discard nor exposes an inaccessible referenced path to the agent. Warn only when
-  // the issue actually mentions a project, so a remote run without any referenced mention stays
-  // silent.
+  // A referenced project realizes as a local directory first. On a remote target the run carries
+  // that tree to the agent only when a confined transport stages it into the sandbox and the
+  // remote flag is on. The confined sandbox transport asserts per-project confinement on each
+  // staged tree (`assertSyncOperationsConfined` in `sandbox-managed-runtime`). The SSH transport
+  // does not, so it stays out of scope. When the remote flag is off the run fails closed. In every
+  // one of those drop cases the run neither does authorization or clone work it must discard nor
+  // exposes an inaccessible referenced path to the agent.
   if (opts.executionTargetIsRemote) {
-    const mentionedIds = await opts.issues.findMentionedProjectIds(issueId, {
-      includeCommentBodies: true,
-    });
-    // Each distinct non-anchor mention is a referenced project this remote run drops. A remote
-    // target has no path to receive the referenced tree, so the run drops the whole set at the
-    // staging layer. Record one failure per dropped project so the requested-vs-synced accounting
-    // counts the whole referenced set and the run still emits its structured sync log.
-    const droppedProjectIds = [
-      ...new Set(mentionedIds.filter((projectId) => projectId !== anchorProjectId)),
-    ];
-    return {
-      additionalWorkspaces: [],
-      warnings:
-        droppedProjectIds.length > 0
-          ? [
-              "Referenced-project workspaces are available only on a local execution target. This run uses a remote execution target, so no referenced-project workspace was attached.",
-            ]
-          : [],
-      failures: droppedProjectIds.map((projectId) => ({ projectId, reason: "staging" as const })),
-    };
+    const remoteReferencedSyncOpen =
+      (opts.remoteReferencedSyncEnabled ?? false) && (opts.targetStagesConfined ?? false);
+    if (!remoteReferencedSyncOpen) {
+      const mentionedIds = await opts.issues.findMentionedProjectIds(issueId, {
+        includeCommentBodies: true,
+      });
+      // Each distinct non-anchor mention is a referenced project this remote run drops. An SSH
+      // target (or the remote flag off) has no confined path to receive the referenced tree, so
+      // the run drops the whole set at the staging layer. Record one failure per dropped project
+      // so the requested-vs-synced accounting counts the whole referenced set and the run still
+      // emits its structured sync log. Warn only when the issue actually mentions a project, so a
+      // remote run without any referenced mention stays silent.
+      const droppedProjectIds = [
+        ...new Set(mentionedIds.filter((projectId) => projectId !== anchorProjectId)),
+      ];
+      return {
+        additionalWorkspaces: [],
+        warnings:
+          droppedProjectIds.length > 0
+            ? [
+                "Referenced-project workspaces are available only on a local execution target or a confined sandbox target. This run uses a different remote execution target, so no referenced-project workspace was attached.",
+              ]
+            : [],
+        failures: droppedProjectIds.map((projectId) => ({ projectId, reason: "staging" as const })),
+      };
+    }
+    // Fall through: a confined sandbox target with the remote flag on resolves and authorizes the
+    // referenced set exactly like a local target. The resolver is driver-agnostic; the confined
+    // sandbox transport downstream stages each admitted tree into its own `project-<projectId>`
+    // directory. The per-project `project:read` check below still runs against the run actor.
   }
 
   const referenced = await resolveRunReferencedProjects(issueId, anchorProjectId, {
@@ -3344,6 +3693,21 @@ export function resolveLedgerCostStatus(input: {
   return input.costUsd == null && hasTokenUsage ? "unpriced" : "reported";
 }
 
+export function resolveCacheAdjustedCostUsd(input: {
+  costUsd?: number | null;
+  cacheAdjustedCostUsd?: number | null;
+}) {
+  const explicit = input.cacheAdjustedCostUsd;
+  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit >= 0) {
+    return explicit;
+  }
+  const reported = input.costUsd;
+  if (typeof reported === "number" && Number.isFinite(reported) && reported >= 0) {
+    return reported;
+  }
+  return null;
+}
+
 export async function resolveLedgerScopeForRun(
   db: Db,
   companyId: string,
@@ -3788,6 +4152,26 @@ export function describeSessionResetReason(
     return "wake reason is heartbeat_timer (unscoped timer wake starts fresh)";
   }
   return null;
+}
+
+/**
+ * Failure signatures from sandbox→host git workspace reconciliation. These
+ * describe the state of the SHARED workspace (divergent histories written by
+ * different runs), not a defect in the agent that happened to run last —
+ * putting the agent into a sticky `error` state over them removes a healthy
+ * agent from rotation while leaving the actual problem (the workspace)
+ * untouched. The run still fails and carries the full message.
+ */
+const WORKSPACE_SYNC_CONFLICT_SIGNATURES = [
+  "Failed to merge concurrent remote git histories",
+  "Failed to integrate concurrent remote git history",
+  "did not send all necessary objects",
+  "lacks these prerequisite commits",
+];
+
+export function isWorkspaceSyncConflictFailure(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return WORKSPACE_SYNC_CONFLICT_SIGNATURES.some((signature) => message.includes(signature));
 }
 
 export function shouldDeferFollowupWakeForSameIssue(input: {
@@ -4470,6 +4854,7 @@ function buildWorkspaceConfigCategoryValues(input: {
     },
     lifecycleCommands: {
       provisionCommand: snapshot.provisionCommand ?? null,
+      runtimeProvisionCommand: snapshot.runtimeProvisionCommand ?? null,
       teardownCommand: snapshot.teardownCommand ?? null,
       cleanupCommand: snapshot.cleanupCommand ?? null,
     },
@@ -6118,6 +6503,41 @@ export interface HeartbeatServiceOptions {
    * the agent's configured skills. Defaults to true (upstream behaviour).
    */
   mentionedSkillInjectionEnabled?: boolean;
+}
+
+type WorkspaceReadyCommentWriter = {
+  addComment: (
+    issueId: string,
+    body: string,
+    actor: { agentId?: string; userId?: string; runId?: string | null },
+    options?: {
+      presentation?: ReturnType<typeof buildWorkspaceReadyPresentation>;
+      metadata?: ReturnType<typeof buildWorkspaceReadyMetadata>;
+    },
+  ) => Promise<unknown>;
+};
+
+export function postWorkspaceReadyComment(input: {
+  issuesSvc: WorkspaceReadyCommentWriter;
+  issueId: string;
+  agentId: string;
+  runId: string;
+  workspace: RealizedExecutionWorkspace;
+  runtimeServices: RuntimeServiceRef[];
+}) {
+  const workspaceReadyInput = {
+    workspace: input.workspace,
+    runtimeServices: input.runtimeServices,
+  };
+  return input.issuesSvc.addComment(
+    input.issueId,
+    buildWorkspaceReadyComment(workspaceReadyInput),
+    { agentId: input.agentId, runId: input.runId },
+    {
+      presentation: buildWorkspaceReadyPresentation(workspaceReadyInput),
+      metadata: buildWorkspaceReadyMetadata(workspaceReadyInput),
+    },
+  );
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -8043,12 +8463,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? projectWorkspaceRows.find((workspace) => workspace.id === preferredProjectWorkspaceId) ?? null
         : null;
       const missingProjectCwds: string[] = [];
+      const materializationFailures: WorkspaceMaterializationFailure[] = [];
       let hasConfiguredProjectCwd = false;
       let preferredWorkspaceWarning: string | null = null;
       if (preferredProjectWorkspaceId && !preferredWorkspace) {
         preferredWorkspaceWarning =
           `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
       }
+      const resolveGitAuth = createGitRemoteAuthProvider(db, agent.companyId, { issueId });
       for (const workspace of projectWorkspaceRows) {
         let projectCwd: string;
         let managedWorkspaceWarning: string | null = null;
@@ -8058,12 +8480,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
             cwd: workspace.cwd,
             repoUrl: workspace.repoUrl,
+            resolveGitAuth,
           });
           projectCwd = resolvedCwd.cwd;
           managedWorkspaceWarning = resolvedCwd.warning;
         } catch (error) {
+          const scrubbedError = scrubGitCredentialText(
+            error instanceof Error ? error.message : String(error),
+          );
+          const workspaceRepoUrl = readNonEmptyString(workspace.repoUrl);
+          materializationFailures.push({
+            projectWorkspaceId: workspace.id,
+            repoUrl: workspaceRepoUrl ? scrubGitCredentialText(workspaceRepoUrl) : null,
+            error: scrubbedError,
+          });
           if (preferredWorkspace?.id === workspace.id) {
-            preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
+            preferredWorkspaceWarning = scrubbedError;
           }
           continue;
         }
@@ -8084,6 +8516,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
               (value): value is string => Boolean(value),
             ),
+            baseCwdFallback: false,
+            materializationFailures,
           };
         }
         if (preferredWorkspace?.id === workspace.id) {
@@ -8095,23 +8529,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
-      const warnings: string[] = [];
-      if (preferredWorkspaceWarning) {
-        warnings.push(preferredWorkspaceWarning);
-      }
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      }
+      const warnings = buildAnchorFallbackWorkspaceNotes({
+        fallbackCwd,
+        preferredWorkspaceWarning,
+        materializationFailures,
+        missingProjectCwds,
+        hasConfiguredProjectCwd,
+      });
       return {
         cwd: fallbackCwd,
         source: "project_primary" as const,
@@ -8121,6 +8545,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
         workspaceHints,
         warnings,
+        baseCwdFallback: true,
+        materializationFailures,
       };
     }
 
@@ -8139,6 +8565,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoRef: null,
         workspaceHints,
         warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
+        baseCwdFallback: false,
+        materializationFailures: [],
       };
     }
 
@@ -8159,6 +8587,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
           workspaceHints,
           warnings: [],
+          baseCwdFallback: false,
+          materializationFailures: [],
         };
       }
     }
@@ -8192,6 +8622,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoRef: null,
       workspaceHints,
       warnings,
+      baseCwdFallback: false,
+      materializationFailures: [],
     };
   }
 
@@ -8204,20 +8636,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null; executionTargetIsRemote?: boolean },
+    opts?: { useProjectWorkspace?: boolean | null; executionEnvironmentDriver?: string | null },
   ): Promise<ResolvedWorkspaceForRun> {
     const anchor = await resolveAnchorWorkspaceForRun(agent, context, previousSessionParams, opts);
     if (!isMultiProjectWorkspaceSyncEnabled()) {
       return { ...anchor, additionalWorkspaces: [], referencedProjectFailures: [] };
     }
 
+    // Derive the remote-transport facts from the selected environment driver. `executionTargetIsRemote`
+    // decides whether the referenced set needs the remote path at all; `targetStagesConfined` decides
+    // whether that remote target confines each staged tree (only the sandbox driver does). The remote
+    // flag is the targeted kill switch; with it off, a remote run fails closed.
+    const executionEnvironmentDriver = opts?.executionEnvironmentDriver ?? null;
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     const { additionalWorkspaces, warnings, failures } = await resolveAdditionalRunWorkspaces(
       issueId,
       anchor.projectId,
       {
         enabled: true,
-        executionTargetIsRemote: opts?.executionTargetIsRemote ?? false,
+        executionTargetIsRemote: isRemoteExecutionEnvironmentDriver(executionEnvironmentDriver),
+        targetStagesConfined: isConfinedRemoteStagingDriver(executionEnvironmentDriver),
+        remoteReferencedSyncEnabled: isMultiProjectWorkspaceSyncRemoteEnabled(),
         companyId: agent.companyId,
         actor: {
           type: "agent",
@@ -9659,12 +10098,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (!intent.shutdownSnapshot) {
       logger.warn(
-        { previousServerPid: intent.previousServerPid },
+        {
+          previousServerPid: intent.previousServerPid,
+          preflightActiveRunIds: intent.preflightActiveRunIds,
+        },
         "hot-restart intent present but shutdown snapshot is missing; no runs can be adopted",
       );
     }
     const candidates = intent.shutdownSnapshot?.activeRuns ?? [];
-    const currentRows = candidates.length > 0
+    const missingSnapshotRunIds = findMissingHotRestartSnapshotRunIds(intent);
+    const reconciliationRunIds = [
+      ...new Set([...candidates.map((run) => run.runId), ...missingSnapshotRunIds]),
+    ];
+    const currentRows = reconciliationRunIds.length > 0
       ? await db
         .select({
           run: heartbeatRuns,
@@ -9672,7 +10118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .from(heartbeatRuns)
         .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-        .where(inArray(heartbeatRuns.id, candidates.map((run) => run.runId)))
+        .where(inArray(heartbeatRuns.id, reconciliationRunIds))
       : [];
     const currentByRunId = new Map(currentRows.map((row) => [row.run.id, row]));
 
@@ -9695,6 +10141,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       else if (classification === "lost") lostRunIds.push(candidate.runId);
       else skippedRunIds.push(candidate.runId);
     };
+
+    for (const runId of missingSnapshotRunIds) {
+      const current = currentByRunId.get(runId);
+      if (!current) {
+        finalizedWhileDownRunIds.push(runId);
+        continue;
+      }
+
+      const candidate = toHotRestartIntentRun(current);
+      if (current.run.status !== "running") {
+        classify(candidate, "finalized_while_down", `run_status_${current.run.status}`);
+      } else {
+        classify(candidate, "lost", "missing_shutdown_snapshot");
+      }
+    }
+
+    if (lostRunIds.length > 0) {
+      logger.error(
+        { previousServerPid: intent.previousServerPid, lostRunIds },
+        "hot-restart shutdown snapshot omitted live preflight runs; reporting them as lost",
+      );
+    }
 
     for (const candidate of candidates) {
       const current = currentByRunId.get(candidate.runId);
@@ -9806,7 +10274,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skippedRunIds,
       runs: reportRuns,
     });
-    await removeHotRestartIntent();
+    await removeHotRestartIntent(undefined, intent);
 
     logger.info(
       {
@@ -9815,6 +10283,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adoptedRunIds,
         finalizedWhileDownRunIds,
         lostRunIds,
+        missingSnapshotRunIds,
         skippedRunIds,
       },
       "hot-restart adoption report written",
@@ -9909,7 +10378,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message);
+      await finalizeAgentStatus(run.agentId, "interrupted", message, {
+        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+      });
       interruptedRunIds.push(interrupted.id);
     }
 
@@ -10018,17 +10489,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issue.assigneeAgentId !== run.agentId) {
-      return {
-        allowed: false,
-        reason: "Scheduled retry suppressed because issue ownership changed",
-        errorCode: "issue_reassigned",
-        issueId,
-        details: {
+      if (!isNonAssigneeWorkspaceBusyRetry(retryReason, contextSnapshot)) {
+        return {
+          allowed: false,
+          reason: "Scheduled retry suppressed because issue ownership changed",
+          errorCode: "issue_reassigned",
           issueId,
-          previousAssigneeAgentId: run.agentId,
-          currentAssigneeAgentId: issue.assigneeAgentId,
-        },
-      };
+          details: {
+            issueId,
+            previousAssigneeAgentId: run.agentId,
+            currentAssigneeAgentId: issue.assigneeAgentId,
+          },
+        };
+      }
     }
 
     if (issue.status === "cancelled" || issue.status === "done") {
@@ -10965,6 +11438,175 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  // Finds a running heartbeat run (other than the caller's) whose context
+  // issue shares the same project workspace, i.e. the run that currently
+  // "holds" the shared working tree. Runs that have been silent past
+  // WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS do not count — a zombie holder must
+  // not park other work forever, and recovery's silent-run escalation is
+  // already reaping it. When isolated workspaces are enabled, holders whose
+  // issue explicitly opted into an isolated workspace never touch the shared
+  // tree, so they are excluded; a NULL/agent_default mode may resolve to the
+  // shared tree and counts as a holder (over-serializing is the safe
+  // direction). When the isolated-workspaces experiment is off, every run
+  // resolves to the shared tree, so no holder is excluded.
+  async function findSharedWorkspaceHolder(input: {
+    companyId: string;
+    projectWorkspaceId: string;
+    excludeIssueId: string;
+    excludeRunId: string;
+    honorIsolatedWorkspaceModes: boolean;
+    now?: Date;
+  }): Promise<SharedWorkspaceHolder | null> {
+    const staleCutoff = new Date(
+      (input.now ?? new Date()).getTime() - WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS,
+    );
+    return await db
+      .select({
+        runId: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        issueId: sql<string>`${issues.id}::text`,
+        issueIdentifier: issues.identifier,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, heartbeatRuns.companyId),
+          sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+        ),
+      )
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.status, "running"),
+          ne(heartbeatRuns.id, input.excludeRunId),
+          // Last observed activity: output beats start beats creation. A run
+          // that started recently but has not written output yet is live.
+          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
+          eq(issues.projectWorkspaceId, input.projectWorkspaceId),
+          ne(sql`${issues.id}::text`, input.excludeIssueId),
+          ...(input.honorIsolatedWorkspaceModes
+            ? [
+                or(
+                  // Covers both a NULL settings blob and a blob without a mode
+                  // key; either may still resolve to the shared workspace.
+                  sql`${issues.executionWorkspaceSettings} ->> 'mode' is null`,
+                  notInArray(
+                    sql`${issues.executionWorkspaceSettings} ->> 'mode'`,
+                    [...ISOLATED_EXECUTION_WORKSPACE_MODES],
+                  ),
+                ),
+              ]
+            : []),
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // Terminal handling for a WorkspaceBusyDeferral thrown by the pre-dispatch
+  // gate: cancel the run (contention is not a failure), schedule a
+  // workspace_busy retry, and leave the agent idle. The issue execution lock
+  // transfers to the scheduled retry run inside scheduleBoundedRetryForRun, so
+  // the issue keeps an active execution path and recovery leaves it alone.
+  // Deferral has no attempt ceiling — the retry keeps rescheduling while a
+  // live holder exists, and holder staleness (not a counter) is what prevents
+  // waiting on a zombie. If no retry could be scheduled (agent no longer
+  // invokable), the lock is released so the issue does not strand on a
+  // cancelled run.
+  async function finalizeWorkspaceBusyDeferral(
+    run: typeof heartbeatRuns.$inferSelect,
+    deferral: WorkspaceBusyDeferral,
+  ) {
+    const now = new Date();
+    const cancelWrite = await setRunStatusIfRunning(run.id, "cancelled", {
+      error: deferral.message,
+      errorCode: WORKSPACE_BUSY_ERROR_CODE,
+      finishedAt: now,
+      resultJson: {
+        workspaceBusy: {
+          projectWorkspaceId: deferral.projectWorkspaceId,
+          holderRunId: deferral.holder.runId,
+          holderIssueId: deferral.holder.issueId,
+          deferralAttempt: deferral.deferralAttempt,
+        },
+      },
+      // Recorded on the run (and inherited by the scheduled retry's context)
+      // so the retry promotion gate can tell a non-assignee wake — where an
+      // assignee mismatch is the expected state — from a reassignment race.
+      contextSnapshot: {
+        ...parseObject(run.contextSnapshot),
+        workspaceBusyDeferredWhileAssignee: deferral.wasIssueAssignee,
+      },
+    });
+    if (!cancelWrite.updated) {
+      logger.info(
+        { runId: run.id, currentStatus: cancelWrite.run?.status ?? null },
+        "skipping workspace-busy deferral finalization because the run already left running state",
+      );
+      return;
+    }
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: deferral.message,
+    }).catch(() => undefined);
+
+    const cancelledRun = cancelWrite.run ?? (await getRun(run.id).catch(() => null));
+    const agentRow = await getAgent(run.agentId).catch(() => null);
+    let scheduleOutcome: string | null = null;
+    if (cancelledRun && agentRow) {
+      const scheduleResult = await scheduleBoundedRetryForRun(cancelledRun, agentRow, {
+        now,
+        retryReason: WORKSPACE_BUSY_RETRY_REASON,
+        wakeReason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+        // Always admit the next attempt: workspace-busy deferral is bounded by
+        // holder liveness, not by an attempt counter.
+        maxAttempts: (cancelledRun.scheduledRetryAttempt ?? 0) + 1,
+        delayMs: computeWorkspaceBusyRetryDelayMs(),
+      }).catch((scheduleErr) => {
+        logger.error(
+          { err: scheduleErr, runId: run.id },
+          "failed to schedule workspace-busy retry after deferral",
+        );
+        return null;
+      });
+      scheduleOutcome = scheduleResult?.outcome ?? null;
+    }
+
+    if (cancelledRun) {
+      await appendRunEvent(cancelledRun, await nextRunEventSeq(cancelledRun.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message:
+          scheduleOutcome === "scheduled"
+            ? `Deferred: ${deferral.message}. Retry ${deferral.deferralAttempt + 1} scheduled; the run waits for the workspace to free.`
+            : `Deferred: ${deferral.message}. No retry could be scheduled; releasing the issue for other runs.`,
+        payload: {
+          projectWorkspaceId: deferral.projectWorkspaceId,
+          holderRunId: deferral.holder.runId,
+          holderIssueId: deferral.holder.issueId,
+          deferralAttempt: deferral.deferralAttempt,
+          retryScheduled: scheduleOutcome === "scheduled",
+        },
+      }).catch(() => undefined);
+    }
+
+    if (cancelledRun && scheduleOutcome !== "scheduled") {
+      await releaseIssueExecutionAndPromote(cancelledRun).catch((releaseErr) => {
+        logger.error(
+          { err: releaseErr, runId: run.id },
+          "failed to release issue execution after workspace-busy deferral",
+        );
+      });
+    }
+
+    await finalizeAgentStatus(run.agentId, "cancelled", null, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    }).catch(() => undefined);
+  }
+
   async function scheduleInteractionContinuationInfrastructureRetryIfEligible(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -11373,6 +12015,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(agents.id, agentId));
   }
 
+  async function claimDueTimerHeartbeat(
+    agent: typeof agents.$inferSelect,
+    now: Date,
+    intervalSec: number,
+  ) {
+    const dueBefore = new Date(now.getTime() - intervalSec * 1000);
+    const claimed = await db
+      .update(agents)
+      .set({
+        lastHeartbeatAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(agents.id, agent.id),
+        eq(agents.companyId, agent.companyId),
+        or(
+          lte(agents.lastHeartbeatAt, dueBefore),
+          and(isNull(agents.lastHeartbeatAt), lte(agents.createdAt, dueBefore)),
+        ),
+      ))
+      .returning({ id: agents.id })
+      .then((rows) => rows[0] ?? null);
+    if (!claimed) return null;
+    return { wasFirstHeartbeat: !agent.lastHeartbeatAt };
+  }
+
+  function timerClaimWasFirstHeartbeat(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
+  ): true | undefined {
+    return parseObject(run.contextSnapshot).timerClaimWasFirstHeartbeat === true
+      ? true
+      : undefined;
+  }
+
   function parseMaxTurnContinuationPolicy(agent: typeof agents.$inferSelect): MaxTurnContinuationPolicy {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -11728,7 +12404,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isCurrentReviewParticipant = reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
 
-    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake && !isCurrentReviewParticipant) {
+    if (
+      issue.assigneeAgentId !== run.agentId &&
+      !isInteractionWake &&
+      !isCurrentReviewParticipant &&
+      !isNonAssigneeWorkspaceBusyRetry(retryReason, context)
+    ) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -11864,7 +12545,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean },
+    options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -11873,7 +12554,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
-    const isFirstHeartbeat = !existing.lastHeartbeatAt;
+    const isFirstHeartbeat = options?.wasFirstHeartbeat ?? !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
     const nextStatus =
@@ -12318,7 +12999,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage);
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
+        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+      });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -12420,10 +13103,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
-    const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
+    const billedCostUsd = resolveCacheAdjustedCostUsd(result);
+    const additionalCostCents = normalizeBilledCostCents(billedCostUsd, billingType);
     const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
-      costUsd: result.costUsd,
+      costUsd: billedCostUsd,
       inputTokens,
       cachedInputTokens,
       outputTokens,
@@ -12793,8 +13477,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueContext.id), isNull(issues.responsibleUserId)));
       issueContext = { ...issueContext, responsibleUserId };
     }
+    const parsedProjectExecutionWorkspacePolicy = parseProjectExecutionWorkspacePolicy(
+      projectContext?.executionWorkspacePolicy,
+    );
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
-      parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
+      parsedProjectExecutionWorkspacePolicy,
       isolatedWorkspacesEnabled,
     );
     const trustPreset = resolveCoreTrustPreset({
@@ -12989,9 +13676,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
       requestedExecutionWorkspaceMode;
-    const executionPolicy = { executionMode: (await instanceSettings.getGeneral()).executionMode };
+    const executionPolicy = { executionMode: resolvedInstanceSettings.general.executionMode };
+    const executionForcedToKubernetes = isExecutionForcedToKubernetes(executionPolicy);
     let selectedEnvironmentId = environmentResolution.environmentId;
-    if (isExecutionForcedToKubernetes(executionPolicy)) {
+    if (executionForcedToKubernetes) {
       let kubernetesEnvironment = await environmentsSvc.findKubernetesEnvironment(agent.companyId);
       if (!kubernetesEnvironment) {
         // Lazy recovery for companies created after the startup bootstrap ran
@@ -13055,6 +13743,79 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       selectedEnvironmentId = kubernetesEnvironment.id;
     }
+    const selectedEnvironmentForConfig = selectedEnvironmentId === localEnvironment.id
+      ? localEnvironment
+      : selectedEnvironmentId
+        ? await environmentsSvc.getById(selectedEnvironmentId)
+        : null;
+    const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
+      projectPolicy: projectExecutionWorkspacePolicy,
+      issueSettings: issueExecutionWorkspaceSettings,
+    });
+    // A live holder is always consulted for shared workspaces. Depending on policy and the final
+    // execution target it either remains the existing deferral gate or becomes dispatch context.
+    // Holder staleness and the workspace_busy retry ladder are intentionally unchanged for every
+    // path that serializes.
+    if (issueRef?.projectWorkspaceId && effectiveExecutionWorkspaceMode === "shared_workspace") {
+      const workspaceHolder = await findSharedWorkspaceHolder({
+        companyId: agent.companyId,
+        projectWorkspaceId: issueRef.projectWorkspaceId,
+        excludeIssueId: issueRef.id,
+        excludeRunId: run.id,
+        honorIsolatedWorkspaceModes: isolatedWorkspacesEnabled,
+      });
+      if (workspaceHolder) {
+        const environmentDriver = selectedEnvironmentForConfig?.driver ?? null;
+        const shouldSerialize = sharedWorkspaceConcurrency === "serialize"
+          || (
+            sharedWorkspaceConcurrency === "auto"
+            && (
+              executionForcedToKubernetes
+              || (environmentDriver !== "local" && environmentDriver !== "ssh")
+            )
+          );
+        if (shouldSerialize) {
+          throw new WorkspaceBusyDeferral({
+            holder: workspaceHolder,
+            projectWorkspaceId: issueRef.projectWorkspaceId,
+            deferralAttempt:
+              run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
+                ? (run.scheduledRetryAttempt ?? 0)
+                : 0,
+            wasIssueAssignee: issueContext?.assigneeAgentId === agent.id,
+          });
+        }
+
+        const holderIssueLabel = workspaceHolder.issueIdentifier ?? workspaceHolder.issueId;
+        const concurrentWorkspaceNote =
+          `shared workspace is concurrently held by run ${workspaceHolder.runId} (issue ${holderIssueLabel}); `
+          + "expect concurrent mutations, coordinate via commits";
+        const appendConcurrentWorkspaceNote = (value: unknown) => {
+          const existing = typeof value === "string" ? value.trimEnd() : "";
+          return existing ? `${existing}\n${concurrentWorkspaceNote}` : concurrentWorkspaceNote;
+        };
+        context.paperclipTaskMarkdown = appendConcurrentWorkspaceNote(context.paperclipTaskMarkdown);
+        if (typeof context.paperclipTaskMarkdownCompact === "string") {
+          context.paperclipTaskMarkdownCompact = appendConcurrentWorkspaceNote(
+            context.paperclipTaskMarkdownCompact,
+          );
+        }
+        logger.info(
+          {
+            event: "shared_workspace_concurrent_dispatch",
+            runId: run.id,
+            issueId: issueRef.id,
+            projectWorkspaceId: issueRef.projectWorkspaceId,
+            holderRunId: workspaceHolder.runId,
+            holderIssueId: workspaceHolder.issueId,
+            sharedWorkspaceConcurrency,
+            environmentDriver,
+            executionForcedToKubernetes,
+          },
+          "Dispatching alongside a live shared-workspace holder",
+        );
+      }
+    }
     const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
       agentConfig: config,
       projectPolicy: projectExecutionWorkspacePolicy,
@@ -13100,14 +13861,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
-    const selectedEnvironmentForConfig = selectedEnvironmentId === localEnvironment.id
-      ? localEnvironment
-      : selectedEnvironmentId
-        ? await environmentsSvc.getById(selectedEnvironmentId)
-        : null;
     // Mentioning a skill in issue text force-injects it, bypassing the agent's own
     // skill configuration. Deployments that source skills from a single external
     // layer can turn that bypass off; upstream behaviour is the default.
+    // (selectedEnvironmentForConfig now lives further up — upstream hoisted it,
+    // so keeping the fork's old copy here would redeclare it in the same scope.)
     const runScopedMentionedSkillKeys = mentionedSkillInjectionEnabled
       ? await resolveRunScopedMentionedSkillKeys({
           db,
@@ -13128,6 +13886,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       heartbeatRunId: run.id,
       environmentId: selectedEnvironmentForConfig?.id ?? null,
       environmentEnv: selectedEnvironmentForConfig?.envVars ?? null,
+      environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
       projectId: projectContext?.id ?? null,
       routineId: routineEnvContext.routineId,
       responsibleUserId,
@@ -13281,12 +14040,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           previousSessionParams,
           {
             useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
-            // Referenced-project workspaces attach on a local execution target only. Gate their
-            // resolution on the selected environment driver so a remote run never resolves a
-            // referenced path it cannot reach. This never changes the anchor workspace.
-            executionTargetIsRemote: isRemoteExecutionEnvironmentDriver(
-              selectedEnvironmentForConfig?.driver,
-            ),
+            // Thread the selected environment driver so run-workspace resolution can tell a local
+            // target from a remote one, and a confined sandbox target from an unconfined remote
+            // target. A remote run resolves referenced projects only for the confined sandbox
+            // transport with the remote flag on. This never changes the anchor workspace.
+            executionEnvironmentDriver: selectedEnvironmentForConfig?.driver ?? null,
           },
         ),
     });
@@ -13309,6 +14067,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       config: hostExecutionWorkspaceConfig,
       issue: issueRef,
       base: executionWorkspaceBase,
+      anchor: {
+        baseCwdFallback: resolvedWorkspace.baseCwdFallback,
+        materializationFailures: resolvedWorkspace.materializationFailures,
+      },
     });
     const workspaceStrategyForFingerprint = parseObject(hostExecutionWorkspaceConfig.workspaceStrategy);
     const workspaceStrategyFingerprintValue =
@@ -13392,6 +14154,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       issueId,
     });
+    // One credential provider per run: base-ref refreshes during workspace realization and
+    // restore authenticate against private GitHub remotes with the same company-secret token
+    // the managed clone uses.
+    const workspaceGitAuthProvider = createGitRemoteAuthProvider(db, agent.companyId, {
+      issueId,
+      heartbeatRunId: run.id,
+    });
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
@@ -13421,6 +14190,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ?? reusableExistingExecutionWorkspace.config?.provisionCommand
                     ?? projectExecutionWorkspacePolicy?.workspaceStrategy?.provisionCommand
                     ?? null,
+                  runtimeProvisionCommand:
+                    configSnapshot?.runtimeProvisionCommand
+                    ?? reusableExistingExecutionWorkspace.config?.runtimeProvisionCommand
+                    ?? projectExecutionWorkspacePolicy?.workspaceStrategy?.runtimeProvisionCommand
+                    ?? null,
                 },
               },
               issue: issueRef,
@@ -13435,6 +14209,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               enableWorkspaceDirtyQuarantineRepair:
                 resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
               recorder: workspaceOperationRecorder,
+              resolveGitAuth: workspaceGitAuthProvider,
             })
           : null,
         realizeWorkspace: () => realizeExecutionWorkspace({
@@ -13453,12 +14228,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           enableWorkspaceDirtyQuarantineRepair:
             resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
           recorder: workspaceOperationRecorder,
+          resolveGitAuth: workspaceGitAuthProvider,
         }),
       });
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
     const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
     let persistedExecutionWorkspace: ExecutionWorkspace | null = null;
-    const nextExecutionWorkspaceMetadata = mergeExecutionWorkspaceMetadataForPersistence({
+    const baseExecutionWorkspaceMetadata = mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
         ? reusableExistingExecutionWorkspace?.metadata ?? null
         : null,
@@ -13473,6 +14249,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       baseRef: executionWorkspace.repoRef,
       baseRefSha: executionWorkspace.baseRefSha ?? null,
     });
+    let persistedWorktreeInstanceRoot =
+      resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
+      && typeof reusableExistingExecutionWorkspace?.metadata?.[WORKTREE_INSTANCE_ROOT_METADATA_KEY] === "string"
+        ? reusableExistingExecutionWorkspace.metadata[WORKTREE_INSTANCE_ROOT_METADATA_KEY]
+        : null;
+    if (
+      !persistedWorktreeInstanceRoot
+      && executionWorkspace.strategy === "git_worktree"
+      && executionWorkspace.worktreePath
+    ) {
+      try {
+        persistedWorktreeInstanceRoot = (
+          await readManagedWorktreeInstanceOwnership(executionWorkspace.worktreePath)
+        )?.instanceRoot ?? null;
+      } catch (error) {
+        logger.warn(
+          {
+            runId: run.id,
+            issueId,
+            executionWorkspaceCwd: executionWorkspace.cwd,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Could not record managed worktree instance ownership",
+        );
+      }
+    }
+    const nextExecutionWorkspaceMetadata = {
+      ...baseExecutionWorkspaceMetadata,
+      ...(persistedWorktreeInstanceRoot
+        ? { [WORKTREE_INSTANCE_ROOT_METADATA_KEY]: persistedWorktreeInstanceRoot }
+        : {}),
+    };
     const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
     const branchNameForInitialPersistence =
       pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
@@ -13535,10 +14343,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               projectId: resolvedProjectId,
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
-              metadata: {
-                createdByRuntime: true,
-                source: executionWorkspace.source,
-              },
+              metadata: nextExecutionWorkspaceMetadata,
             },
             projectWorkspace: {
               cwd: resolvedWorkspace.cwd,
@@ -14181,6 +14986,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         config: hostExecutionWorkspaceConfig,
         adapterEnv,
         onLog,
+        recorder: workspaceOperationRecorder,
       });
       if (runtimeServices.length > 0) {
         context.paperclipRuntimeServices = runtimeServices;
@@ -14196,14 +15002,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
         try {
-          await issuesSvc.addComment(
+          await postWorkspaceReadyComment({
+            issuesSvc,
             issueId,
-            buildWorkspaceReadyComment({
-              workspace: executionWorkspace,
-              runtimeServices,
-            }),
-            { agentId: agent.id, runId: run.id },
-          );
+            agentId: agent.id,
+            runId: run.id,
+            workspace: executionWorkspace,
+            runtimeServices,
+          });
         } catch (err) {
           await onLog(
             "stderr",
@@ -14482,6 +15288,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onLog,
           onMeta: onAdapterMeta,
           onEvent: onAdapterEvent,
+          // The endpoint-gated OpenTelemetry startup trace context. It is a
+          // no-op unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set and the OTel
+          // packages are installed, so the sandbox-start span path stays inert
+          // by default.
+          startupTraceContext: getStartupTraceContext(),
           onRuntimeProgress: async (progress) => {
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
           },
@@ -14535,6 +15346,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
+      // Reconcile the referenced-project set against the real remote staging outcome. A referenced
+      // project can pass authorization and clone locally at run prep, then fail to stage into the
+      // sandbox during execution. The run-prep observability above counts such a project as synced,
+      // so emit a second, stage-time line that counts each staging failure as a first-class
+      // `staging` failure. The synced set is the resolved referenced projects minus the ones that
+      // failed to stage. A run with no staging failure stays silent, so the anchor-only and
+      // fully-synced paths add no noise.
+      const referencedProjectStagingFailures = adapterResult.referencedProjectStagingFailures ?? [];
+      if (referencedProjectStagingFailures.length > 0) {
+        const stagingFailedProjectIds = new Set(
+          referencedProjectStagingFailures.map((failure) => failure.projectId),
+        );
+        const stagedProjectObservability = buildReferencedProjectRunObservability({
+          syncedProjectIds: resolvedWorkspace.additionalWorkspaces
+            .map((additional) => additional.projectId)
+            .filter((projectId) => !stagingFailedProjectIds.has(projectId)),
+          failures: referencedProjectStagingFailures.map((failure) => ({
+            projectId: failure.projectId,
+            reason: "staging" as const,
+          })),
+        });
+        logger.info(
+          {
+            runId: run.id,
+            companyId: agent.companyId,
+            issueId: issueRef?.id ?? null,
+            ...stagedProjectObservability,
+          },
+          "run referenced-project remote staging",
+        );
+      }
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -14567,14 +15409,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(eq(heartbeatRuns.id, run.id));
         if (issueId) {
           try {
-            await issuesSvc.addComment(
+            await postWorkspaceReadyComment({
+              issuesSvc,
               issueId,
-              buildWorkspaceReadyComment({
-                workspace: executionWorkspace,
-                runtimeServices: adapterManagedRuntimeServices,
-              }),
-              { agentId: agent.id, runId: run.id },
-            );
+              agentId: agent.id,
+              runId: run.id,
+              workspace: executionWorkspace,
+              runtimeServices: adapterManagedRuntimeServices,
+            });
           } catch (err) {
             await onLog(
               "stderr",
@@ -14652,8 +15494,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "timed_out"
               : "failed";
 
+      const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
       const usageJson =
-        normalizedUsage || adapterResult.costUsd != null
+        normalizedUsage || adapterResult.costUsd != null || cacheAdjustedCostUsd != null
           ? ({
               ...(normalizedUsage ?? {}),
               ...(rawUsage ? {
@@ -14679,8 +15522,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               biller: resolveLedgerBiller(adapterResult),
               model: readNonEmptyString(adapterResult.model) ?? "unknown",
               ...(adapterResult.costUsd != null ? { costUsd: adapterResult.costUsd } : {}),
+              ...(cacheAdjustedCostUsd != null ? { cacheAdjustedCostUsd } : {}),
               costStatus: resolveLedgerCostStatus({
-                costUsd: adapterResult.costUsd,
+                costUsd: cacheAdjustedCostUsd,
                 inputTokens: normalizedUsage?.inputTokens ?? 0,
                 cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
                 outputTokens: normalizedUsage?.outputTokens ?? 0,
@@ -14895,7 +15739,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         {
           keepIdleOnFailure:
             outcome === "failed" &&
-            (finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota"),
+            ((finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota") ||
+              isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         },
       );
     } catch (err) {
@@ -15019,9 +15865,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      await finalizeAgentStatus(agent.id, "failed", message, {
+        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+        keepIdleOnFailure: isWorkspaceSyncConflictFailure(message),
+      });
     }
     } catch (outerErr) {
+          if (isWorkspaceBusyDeferral(outerErr)) {
+            // Expected contention on a shared project workspace, not a
+            // failure: park the run as a bounded scheduled retry and leave the
+            // holder undisturbed. The finally block below still releases
+            // leases, runtime services, and scratch for this run.
+            await finalizeWorkspaceBusyDeferral(run, outerErr).catch((deferralErr) => {
+              logger.error(
+                { err: deferralErr, runId },
+                "failed to finalize workspace-busy deferral",
+              );
+            });
+          } else {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
           const message = redactCurrentUserText(
@@ -15119,7 +15980,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
           if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+            await finalizeAgentStatus(run.agentId, "failed", message, {
+              wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+            }).catch(() => undefined);
+          }
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
@@ -15209,9 +16073,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function buildWorkspaceValidationRecoveryComment(input: {
-    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    latestRun:
+      | Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">
+      | null
+      | undefined;
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const validationReason = readNonEmptyString(
+      readWorkspaceValidationPayloadFromRun(input.latestRun).reason,
+    );
+    if (validationReason === "git_worktree_base_materialization_failed") {
+      return (
+        "Paperclip stopped before launching the local adapter because the project workspace checkout could not be prepared " +
+        `(for example the repository clone failed).${failureSummary ?? ""} ` +
+        "Moving it to `blocked` with a source-scoped recovery action so the repository URL, clone access, or configured local cwd can be repaired before resuming."
+      );
+    }
     return (
       "Paperclip stopped before launching the local adapter because the issue workspace failed validation. " +
       `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
@@ -17421,7 +18298,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled");
+    await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
   }
@@ -17900,6 +18779,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+        const timerClaim = await claimDueTimerHeartbeat(agent, now, policy.intervalSec);
+        if (!timerClaim) continue;
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -17911,6 +18792,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             source: "scheduler",
             reason: "interval_elapsed",
             now: now.toISOString(),
+            timerClaimWasFirstHeartbeat: timerClaim.wasFirstHeartbeat,
           },
         });
         if (run) enqueued += 1;
