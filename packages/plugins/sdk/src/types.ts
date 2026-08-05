@@ -1412,6 +1412,10 @@ export interface PluginIssuesClient {
       | "requestDepth"
       | "executionWorkspaceId"
       | "executionWorkspacePreference"
+      // A plugin that blocks an issue has to be able to say who unblocks it and
+      // how; the RPC and the service already carried this field, only the type
+      // stopped short, which forced a cast at every call site.
+      | "unblockDescriptor"
     >> & {
       blockedByIssueIds?: string[];
       labelIds?: string[];
