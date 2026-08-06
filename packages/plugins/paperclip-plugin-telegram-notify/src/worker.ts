@@ -82,14 +82,27 @@ const plugin = definePlugin({
      * the others, so each send is guarded on its own — the alternative loses
      * the message for everyone because one person blocked the bot.
      */
-    const broadcast = async (config: NotifyConfig, companyId: string, text: string): Promise<void> => {
+    const broadcast = async (
+      config: NotifyConfig,
+      companyId: string,
+      kind: string,
+      text: string,
+    ): Promise<void> => {
       const token = await ctx.secrets.resolve(config.token, { companyId, configPath: "token" });
       const client = new TelegramClient({
         token,
         fetchImpl: (url, init) => ctx.http.fetch(url, init),
       });
       for (const chatId of config.chatIds) {
-        await guard(ctx, `send to chat ${chatId}`, () => client.sendMessage({ chatId, text }));
+        await guard(ctx, `send to chat ${chatId}`, async () => {
+          await client.sendMessage({ chatId, text });
+          // Logged on success as well as on failure. A notifier that is silent
+          // when it works is one you cannot tell apart from a notifier that is
+          // silent because it never fired — and that is the exact question you
+          // ask when a message does not arrive. The text is not logged: it is
+          // already on the board, and the log is not the place for it.
+          ctx.logger.info("Telegram notification sent", { chatId, kind });
+        });
       }
     };
 
@@ -104,6 +117,7 @@ const plugin = definePlugin({
         await broadcast(
           config,
           event.companyId,
+          "escalation",
           formatEscalation({
             issue,
             issueId,
@@ -136,6 +150,7 @@ const plugin = definePlugin({
         await broadcast(
           config,
           event.companyId,
+          "run-failed",
           formatRunFailure({
             issue,
             issueId,
@@ -155,6 +170,7 @@ const plugin = definePlugin({
         await broadcast(
           config,
           event.companyId,
+          "budget-opened",
           formatBudget({ state: "opened", reason: str(payloadOf(event), "reason"), link: null }),
         );
       }),
@@ -167,6 +183,7 @@ const plugin = definePlugin({
         await broadcast(
           config,
           event.companyId,
+          "budget-resolved",
           formatBudget({ state: "resolved", reason: null, link: null }),
         );
       }),
@@ -208,6 +225,7 @@ const plugin = definePlugin({
         await broadcast(
           config,
           event.companyId,
+          "waiting-for-human",
           formatWaitingForHuman({
             issue: {
               id: issue.id,
