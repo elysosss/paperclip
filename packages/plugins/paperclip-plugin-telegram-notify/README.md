@@ -23,7 +23,7 @@ cached or logged), the mirror's failure discipline (every handler wrapped, failu
 | `escalation-raised` | **Needs a human** — task key, why, board link | The one event that means a human is required |
 | `agent.run.failed` | **Run failed** — agent, run id, truncated error | A failed run still spends the day's cap, so this means today is over, not that it will retry |
 | `budget.incident.opened` / `.resolved` | **Budget stopped work** / resolved | Money stopped, or restarted |
-| `run-ended-unfinished` | **Waiting for you** — task key, what to do | The completion check parked a task |
+| `issue.updated` → `blocked` | **Waiting for you** — task key and the unblock action | A task became somebody's to decide |
 
 The spec allowed three and said a fourth needs an argument. The argument for the fourth: every
 loop in this kit that produces work for the owner terminates in a parked task — the completion
@@ -32,11 +32,21 @@ message, the output of an overnight run is invisible until somebody opens the bo
 exact failure the notifier exists to prevent. It is a filter on an event that already exists, and
 it can be switched off on its own.
 
-**Two events are plugin-to-plugin and their names are namespaced**:
-`plugin.paperclip-plugin-escalation.escalation-raised` and
-`plugin.paperclip-plugin-run-completion.run-ended-unfinished`. The emitter passes the bare name;
-every subscriber must use the prefixed one. Subscribing to the bare name compiles, runs, and
-silently receives nothing for ever.
+**It watches the board state, not the completion check's event.** Subscribing to
+`run-ended-unfinished` was the first design and it was wrong: that event only fires for a run that
+*abandoned* a task, so every deliberate hand-off — a reviewer agent finishing its work and
+refusing to merge — would have gone unannounced, and those are most of them. The rule is now the
+transition into `blocked`, whoever caused it. Only the transition sends: an edit to a task that
+was already parked is the board being edited, not news.
+
+The message leads with the `unblockDescriptor.action` when there is one. "Merge or close PR #14"
+is something you can act on from a phone; "blocked" is not. When the unblock owner is a named
+user it says **Waiting for you**; when it is `board` — meaning anyone — it says **Task parked**.
+
+**The escalation event is plugin-to-plugin, and its name is namespaced**:
+`plugin.paperclip-plugin-escalation.escalation-raised`. The emitter passes the bare name; every
+subscriber must use the prefixed one. Subscribing to the bare name compiles, runs, and silently
+receives nothing for ever.
 
 ## What it deliberately does not send
 
@@ -94,13 +104,13 @@ Every send has a 10-second deadline. A hung connection to Telegram must not hold
 for ever — that is the mirror's open bug ([kit #11](https://github.com/elysosss/agent-company-kit/issues/11))
 and there was no reason to reproduce it here.
 
-Replay is handled for the parked-task message: the last run id per issue is kept in plugin state,
-so a re-delivered event does not buzz the phone twice.
+Replay is handled for the parked-task message: the last seen status per issue is kept in plugin
+state, so a re-delivered `issue.updated` does not buzz the phone twice.
 
 ## Tests
 
 ```bash
-pnpm test        # 30, offline — no board, no network, fetch stubbed
+pnpm test        # 32, offline — no board, no network, fetch stubbed
 pnpm typecheck
 ```
 

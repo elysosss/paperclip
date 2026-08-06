@@ -113,18 +113,22 @@ export function formatBudget(input: {
  * completion check parks an abandoned task like this, and a reviewer agent that
  * will not merge parks a finished one the same way. Without this message the
  * output of an overnight run is invisible until someone opens the board, which
- * is the failure the notifier exists to prevent. It is a filter on an event
- * that already exists, not a new event, and it can be switched off alone.
+ * is the failure the notifier exists to prevent.
+ *
+ * The unblock action is the useful half. "Merge or close PR #14" is something
+ * you can act on from a phone; "blocked" on its own is not.
  */
 export function formatWaitingForHuman(input: {
   issue: IssueRef | null;
   issueId: string | null;
-  reason: string | null;
   action: string | null;
+  ownedByYou: boolean;
   link: string | null;
 }): string {
-  const lines = ["<b>Waiting for you</b>", issueLabel(input.issue, input.issueId)];
-  if (input.action) lines.push(escapeHtml(clip(input.action, 200)));
-  else if (input.reason) lines.push(escapeHtml(clip(input.reason, 200)));
+  const lines = [
+    input.ownedByYou ? "<b>Waiting for you</b>" : "<b>Task parked</b>",
+    issueLabel(input.issue, input.issueId),
+  ];
+  lines.push(input.action ? escapeHtml(clip(input.action, 200)) : "No unblock action was recorded.");
   return withLink(lines, input.link);
 }

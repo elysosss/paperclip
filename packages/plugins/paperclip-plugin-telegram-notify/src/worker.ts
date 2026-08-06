@@ -5,11 +5,7 @@ import {
   type PluginEvent,
 } from "@paperclipai/plugin-sdk";
 import { parseConfig, type NotifyConfig } from "./config.js";
-import {
-  ESCALATION_EVENT,
-  RUN_ENDED_UNFINISHED_EVENT,
-  STATE_KEYS,
-} from "./constants.js";
+import { ESCALATION_EVENT, STATE_KEYS, WAITING_STATUS } from "./constants.js";
 import {
   boardLink,
   formatBudget,
@@ -177,37 +173,53 @@ const plugin = definePlugin({
     );
 
     /**
-     * The completion check parked a task. Subscribing to its event rather than
-     * re-deriving the judgement from `issue.updated` keeps one implementation
-     * of the rule; this plugin only renders the verdict.
+     * A task became somebody's to decide. Watched on the board state rather
+     * than on the completion check's event, because a reviewer agent that
+     * finishes its work and refuses to merge parks a task exactly the same way
+     * and emits nothing — and that hand-off is most of them.
      */
-    ctx.events.on(RUN_ENDED_UNFINISHED_EVENT, (event) =>
-      guard(ctx, RUN_ENDED_UNFINISHED_EVENT, async () => {
+    ctx.events.on("issue.updated", (event) =>
+      guard(ctx, "issue.updated", async () => {
+        const issueId = event.entityId;
+        if (!issueId) return;
         const config = await readConfig(ctx, event.companyId);
         if (!config?.notify.waitingForHuman) return;
-        const issueId = str(payloadOf(event), "issueId");
-        if (!issueId) return;
 
-        // Events can be re-delivered. Remembering the last parked run means a
-        // replay does not buzz the phone twice for one task.
-        const runId = str(payloadOf(event), "runId") ?? "";
+        const issue = await ctx.issues.get(issueId, event.companyId);
+        if (!issue) return;
+
+        // Only the transition into the status is worth a message. An update to
+        // a task that was already parked is the board being edited, not news.
         const scope = { scopeKind: "issue" as const, scopeId: issueId };
-        const seen = await ctx.state.get({ ...scope, stateKey: STATE_KEYS.lastHumanWaitStatus });
-        if (typeof seen === "string" && seen === runId) return;
+        const seen = await ctx.state.get({ ...scope, stateKey: STATE_KEYS.lastStatus });
+        const previous = typeof seen === "string" ? seen : null;
+        await ctx.state.set({ ...scope, stateKey: STATE_KEYS.lastStatus }, issue.status);
+        if (issue.status !== WAITING_STATUS || previous === WAITING_STATUS) return;
 
-        const issue = await lookupIssue(ctx, issueId, event.companyId);
+        const descriptor = issue.unblockDescriptor as
+          | { owner?: unknown; action?: unknown }
+          | null
+          | undefined;
+        const owner = descriptor?.owner;
+        // `{ userId }` means a named person owns the unblock; `"board"` means
+        // anyone. Both need a human, only one of them is addressed to you.
+        const ownedByYou = typeof owner === "object" && owner !== null && "userId" in owner;
+
         await broadcast(
           config,
           event.companyId,
           formatWaitingForHuman({
-            issue,
+            issue: {
+              id: issue.id,
+              key: typeof issue.identifier === "string" ? issue.identifier : null,
+              title: typeof issue.title === "string" ? issue.title : null,
+            },
             issueId,
-            reason: "A run ended without finishing this task.",
-            action: "Read it, then either finish it or send it back.",
-            link: boardLink(config.boardBaseUrl, issue),
+            action: typeof descriptor?.action === "string" ? descriptor.action : null,
+            ownedByYou,
+            link: boardLink(config.boardBaseUrl, { id: issue.id, key: null, title: null }),
           }),
         );
-        await ctx.state.set({ ...scope, stateKey: STATE_KEYS.lastHumanWaitStatus }, runId);
       }),
     );
 

@@ -3,7 +3,7 @@ import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { Agent, Issue } from "@paperclipai/shared";
 import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
-import { ESCALATION_EVENT, RUN_ENDED_UNFINISHED_EVENT } from "../src/constants.js";
+import { ESCALATION_EVENT } from "../src/constants.js";
 import { parseConfig } from "../src/config.js";
 import { boardLink, clip, formatRunFailure, issueLabel } from "../src/format.js";
 import { escapeHtml, TelegramApiError } from "../src/telegram.js";
@@ -115,14 +115,24 @@ async function setup(
       { entityId: "run_9", companyId: COMPANY_ID },
     );
 
-  const park = (payload: Record<string, unknown> = {}) =>
-    harness.emit(
-      RUN_ENDED_UNFINISHED_EVENT as `plugin.${string}`,
-      { issueId: ISSUE_ID, runId: "run_9", ...payload },
-      { companyId: COMPANY_ID },
-    );
+  /**
+   * Moves the task on the board and lets the plugin observe it, which is what
+   * a parking agent actually does — the plugin is not told, it notices.
+   */
+  const setStatus = async (status: string, overrides: Partial<Issue> = {}) => {
+    // Re-seeded rather than written through the context: this plugin holds no
+    // write capability at all, which is itself part of what is being asserted.
+    harness.seed({ issues: [makeIssue({ status, ...overrides } as Partial<Issue>)] });
+    await harness.emit("issue.updated", {}, { entityId: ISSUE_ID, companyId: COMPANY_ID });
+  };
 
-  return { harness, sent: telegram.sent, escalate, failRun, park };
+  const park = (overrides: Partial<Issue> = {}) =>
+    setStatus("blocked", {
+      unblockDescriptor: { owner: { userId: "user_owner" }, action: "Merge or close PR #14" },
+      ...overrides,
+    } as Partial<Issue>);
+
+  return { harness, sent: telegram.sent, escalate, failRun, park, setStatus };
 }
 
 describe("the allowlist is the whole authorisation model", () => {
@@ -201,11 +211,19 @@ describe("what reaches the phone", () => {
     expect(sent[0].text).toContain("Run failed");
   });
 
-  it("reports a parked task as waiting for you", async () => {
+  it("reports a parked task as waiting for you, with the unblock action", async () => {
     const { sent, park } = await setup();
     await park();
     expect(sent[0].text).toContain("Waiting for you");
     expect(sent[0].text).toContain("KIT-9");
+    expect(sent[0].text).toContain("Merge or close PR #14");
+  });
+
+  it("says parked rather than waiting for you when the board owns the unblock", async () => {
+    const { sent, park } = await setup();
+    await park({ unblockDescriptor: { owner: "board", action: "Decide the split" } } as never);
+    expect(sent[0].text).toContain("Task parked");
+    expect(sent[0].text).not.toContain("Waiting for you");
   });
 
   it("escapes a title that would otherwise break the HTML parse", async () => {
@@ -288,19 +306,27 @@ describe("failure does not propagate", () => {
   });
 });
 
-describe("replay", () => {
-  it("does not buzz twice for the same parked run", async () => {
+describe("only the transition is news", () => {
+  it("does not buzz twice for a task that was already parked", async () => {
     const { sent, park } = await setup();
     await park();
     await park();
     expect(sent).toHaveLength(1);
   });
 
-  it("does send again when a later run parks the same task", async () => {
-    const { sent, park } = await setup();
-    await park({ runId: "run_9" });
-    await park({ runId: "run_10" });
+  it("sends again after the task was unparked and parked once more", async () => {
+    const { sent, park, setStatus } = await setup();
+    await park();
+    await setStatus("in_progress");
+    await park();
     expect(sent).toHaveLength(2);
+  });
+
+  it("says nothing about a status that is not parked", async () => {
+    const { sent, setStatus } = await setup();
+    await setStatus("in_review");
+    await setStatus("done");
+    expect(sent).toEqual([]);
   });
 });
 
