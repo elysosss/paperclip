@@ -12,6 +12,9 @@ const manifest: PaperclipPluginManifestV1 = {
   categories: ["automation"],
   capabilities: [
     "events.subscribe",
+    // Emits `notification-undelivered` so the GitHub mirror can carry a message
+    // this plugin could not deliver.
+    "events.emit",
     "issues.read",
     "agents.read",
     "plugin.state.read",

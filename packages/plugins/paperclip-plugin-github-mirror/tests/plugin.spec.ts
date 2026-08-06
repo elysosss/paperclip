@@ -290,6 +290,46 @@ describe("mirror behaviour", () => {
     expect((comment?.body as { body: string }).body).toContain("needs a human");
   });
 
+  it("carries a notification Telegram could not deliver", async () => {
+    const { harness, fetcher } = await setupHarness();
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+
+    await harness.emit(
+      "plugin.paperclip-plugin-telegram-notify.notification-undelivered",
+      {
+        issueId: "iss_1",
+        kind: "waiting-for-human",
+        text: "<b>Waiting for you</b>\nCON-12 · Merge or close PR #14",
+        reason: "sendMessage failed: timed out",
+      },
+      { companyId: COMPANY_ID },
+    );
+
+    const comment = fetcher.calls.filter((c) => c.url.endsWith("/comments")).at(-1);
+    const body = (comment?.body as { body: string }).body;
+    // The point of the fallback: the message itself survives, not just a notice
+    // that something was lost.
+    expect(body).toContain("Merge or close PR #14");
+    expect(body).toContain("could not be delivered");
+    expect(body).toContain("waiting-for-human");
+    expect(body).toContain("timed out");
+  });
+
+  it("says nothing when an undelivered notification names no task", async () => {
+    const { harness, fetcher } = await setupHarness();
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+    const before = fetcher.calls.length;
+
+    // A budget incident is company-level: there is no issue to comment on.
+    await harness.emit(
+      "plugin.paperclip-plugin-telegram-notify.notification-undelivered",
+      { issueId: null, kind: "budget-opened", text: "<b>Budget stopped work</b>" },
+      { companyId: COMPANY_ID },
+    );
+
+    expect(fetcher.calls.length).toBe(before);
+  });
+
   it("reports a budget stop as a pause, not a failure", async () => {
     const { harness, fetcher } = await setupHarness();
     await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });

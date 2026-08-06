@@ -38,3 +38,14 @@ export const WAITING_STATUS = "blocked";
 export const MAX_ERROR_CHARS = 280;
 
 export const TELEGRAM_API_BASE = "https://api.telegram.org";
+
+/**
+ * Emitted when a message could not be delivered to a single allowlisted chat.
+ * The GitHub mirror listens and writes it onto the mirrored issue instead, so a
+ * notification that cannot reach a phone is not simply lost.
+ *
+ * Emitted rather than written to GitHub here on purpose: this plugin knows
+ * nothing about GitHub, exactly as the escalation plugin knows nothing about
+ * either of us. The bus is where the surfaces meet.
+ */
+export const UNDELIVERED_EVENT = "notification-undelivered";

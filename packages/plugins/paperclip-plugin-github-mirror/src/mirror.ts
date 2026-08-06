@@ -79,3 +79,24 @@ export function formatBudgetComment(kind: "opened" | "resolved", reason?: string
     ? `⏸️ **Paused — budget limit reached.**${reason ? ` ${reason}` : ""} Work resumes when the limit resets.`
     : `▶️ **Budget incident resolved.** Work can continue.`;
 }
+
+/**
+ * A notification that could not be delivered elsewhere, rendered for GitHub.
+ *
+ * The text arrives as Telegram-flavoured HTML — `<b>` and `<code>`, which GitHub
+ * renders too — so it is passed through rather than re-rendered. Re-rendering
+ * would mean a second copy of every message format, drifting from the first.
+ */
+export function formatUndeliveredNotice(input: {
+  kind: string;
+  text: string;
+  reason: string | null;
+}): string {
+  return [
+    "📵 **This was meant to reach a phone and could not be delivered.**",
+    "",
+    input.text,
+    "",
+    `_Notification: \`${input.kind}\`. Delivery failed: ${input.reason ?? "no reason reported"}._`,
+  ].join("\n");
+}

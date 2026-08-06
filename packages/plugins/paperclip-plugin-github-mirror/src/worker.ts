@@ -7,7 +7,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import type { IssueStatus } from "@paperclipai/shared";
 import { GithubApiError, GithubClient } from "./github.js";
-import { ESCALATION_EVENT, STATE_KEYS } from "./constants.js";
+import { ESCALATION_EVENT, STATE_KEYS, TELEGRAM_UNDELIVERED_EVENT } from "./constants.js";
 import {
   formatBody,
   formatBudgetComment,
@@ -15,6 +15,7 @@ import {
   formatRunFailureComment,
   formatStatusComment,
   formatTitle,
+  formatUndeliveredNotice,
   githubStateFor,
   statusLabel,
 } from "./mirror.js";
@@ -248,6 +249,35 @@ const plugin = definePlugin({
             reviewReturns: payload.reviewReturns ?? 0,
             gateFailures: payload.gateFailures ?? 0,
             threshold: payload.threshold ?? 0,
+          }),
+        );
+      }),
+    );
+
+    // Plugin-to-plugin: the Telegram notifier could not reach a phone, so the
+    // message lands here instead. GitHub is already the surface a human can
+    // glance at; this stops an undeliverable notification being merely a log
+    // line on a machine nobody is looking at.
+    ctx.events.on(TELEGRAM_UNDELIVERED_EVENT, (event) =>
+      guard(ctx, TELEGRAM_UNDELIVERED_EVENT, async () => {
+        const payload = (event.payload ?? {}) as {
+          issueId?: unknown;
+          kind?: unknown;
+          text?: unknown;
+          reason?: unknown;
+        };
+        const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
+        const text = typeof payload.text === "string" ? payload.text : null;
+        // Without a task there is no issue to comment on. A budget incident is
+        // the case: company-level, no task. It stays in the log.
+        if (!issueId || !text) return;
+        await commentOnIssue(
+          issueId,
+          event.companyId,
+          formatUndeliveredNotice({
+            kind: typeof payload.kind === "string" ? payload.kind : "notification",
+            text,
+            reason: typeof payload.reason === "string" ? payload.reason : null,
           }),
         );
       }),

@@ -5,7 +5,7 @@ import {
   type PluginEvent,
 } from "@paperclipai/plugin-sdk";
 import { parseConfig, type NotifyConfig } from "./config.js";
-import { ESCALATION_EVENT, STATE_KEYS, WAITING_STATUS } from "./constants.js";
+import { ESCALATION_EVENT, STATE_KEYS, UNDELIVERED_EVENT, WAITING_STATUS } from "./constants.js";
 import {
   boardLink,
   formatBudget,
@@ -87,21 +87,55 @@ const plugin = definePlugin({
       companyId: string,
       kind: string,
       text: string,
+      issueId: string | null,
     ): Promise<void> => {
       const token = await ctx.secrets.resolve(config.token, { companyId, configPath: "token" });
       const client = new TelegramClient({
         token,
         fetchImpl: (url, init) => ctx.http.fetch(url, init),
       });
+
+      let delivered = 0;
+      let lastFailure: string | null = null;
+
       for (const chatId of config.chatIds) {
-        await guard(ctx, `send to chat ${chatId}`, async () => {
+        try {
           await client.sendMessage({ chatId, text });
+          delivered += 1;
           // Logged on success as well as on failure. A notifier that is silent
           // when it works is one you cannot tell apart from a notifier that is
           // silent because it never fired — and that is the exact question you
           // ask when a message does not arrive. The text is not logged: it is
           // already on the board, and the log is not the place for it.
           ctx.logger.info("Telegram notification sent", { chatId, kind });
+        } catch (error) {
+          // One chat failing must not silence the others, so the loop continues.
+          const retryable = error instanceof TelegramApiError ? error.retryable : false;
+          const retryAfterSec = error instanceof TelegramApiError ? error.retryAfterSec : null;
+          lastFailure = error instanceof Error ? error.message : String(error);
+          ctx.logger.error(`Telegram notify: send to chat ${chatId} failed`, {
+            message: lastFailure,
+            kind,
+            retryable,
+            ...(retryAfterSec !== null ? { retryAfterSec } : {}),
+          });
+        }
+      }
+
+      // Nobody got it. Hand it to whatever else is listening — the GitHub mirror
+      // writes it onto the mirrored issue — rather than dropping a message whose
+      // whole purpose was to reach a human. A partial delivery is a delivery:
+      // the message arrived somewhere, and a duplicate on GitHub is noise.
+      if (delivered === 0 && config.chatIds.length > 0) {
+        await ctx.events.emit(UNDELIVERED_EVENT, companyId, {
+          issueId,
+          kind,
+          text,
+          reason: lastFailure,
+        });
+        ctx.logger.warn("Telegram unreachable; handed the notification to the bus", {
+          kind,
+          issueId,
         });
       }
     };
@@ -126,6 +160,7 @@ const plugin = definePlugin({
             threshold: num(raw, "threshold"),
             link: boardLink(config.boardBaseUrl, issue),
           }),
+          issueId,
         );
       }),
     );
@@ -159,6 +194,7 @@ const plugin = definePlugin({
             message: str(raw, "error") ?? str(raw, "message"),
             link: boardLink(config.boardBaseUrl, issue),
           }),
+          issueId,
         );
       }),
     );
@@ -172,6 +208,9 @@ const plugin = definePlugin({
           event.companyId,
           "budget-opened",
           formatBudget({ state: "opened", reason: str(payloadOf(event), "reason"), link: null }),
+          // A budget incident is a company-level event; there is no task to
+          // hang the fallback comment on.
+          null,
         );
       }),
     );
@@ -185,6 +224,7 @@ const plugin = definePlugin({
           event.companyId,
           "budget-resolved",
           formatBudget({ state: "resolved", reason: null, link: null }),
+          null,
         );
       }),
     );
@@ -237,6 +277,7 @@ const plugin = definePlugin({
             ownedByYou,
             link: boardLink(config.boardBaseUrl, { id: issue.id, key: null, title: null }),
           }),
+          issueId,
         );
       }),
     );

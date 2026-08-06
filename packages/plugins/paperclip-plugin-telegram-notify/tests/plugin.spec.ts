@@ -97,6 +97,11 @@ async function setup(
   const telegram = stubTelegram(input.responder);
   harness.ctx.http.fetch = telegram.impl as typeof harness.ctx.http.fetch;
 
+  const undelivered: Array<Record<string, unknown>> = [];
+  harness.ctx.events.on(`plugin.${manifest.id}.notification-undelivered`, async (event) => {
+    undelivered.push((event.payload ?? {}) as Record<string, unknown>);
+  });
+
   const issue = input.issue === undefined ? makeIssue() : input.issue;
   harness.seed({ issues: issue ? [issue] : [], agents: [makeAgent()] });
   await plugin.definition.setup(harness.ctx);
@@ -132,7 +137,7 @@ async function setup(
       ...overrides,
     } as Partial<Issue>);
 
-  return { harness, sent: telegram.sent, escalate, failRun, park, setStatus };
+  return { harness, sent: telegram.sent, undelivered, escalate, failRun, park, setStatus };
 }
 
 describe("the allowlist is the whole authorisation model", () => {
@@ -374,5 +379,46 @@ describe("the pieces on their own", () => {
       CHAT_ID,
       OTHER_CHAT_ID,
     ]);
+  });
+});
+
+describe("when nobody can be reached, the message is not lost", () => {
+  const dead = () => new Response("gateway timed out", { status: 504 });
+
+  it("hands an undeliverable notification to the bus, text and all", async () => {
+    const { undelivered, park } = await setup({ responder: dead });
+    await park();
+    expect(undelivered).toHaveLength(1);
+    expect(undelivered[0].kind).toBe("waiting-for-human");
+    expect(undelivered[0].issueId).toBe(ISSUE_ID);
+    // The message itself travels, so the surface that picks it up does not have
+    // to render a second copy of every format.
+    expect(String(undelivered[0].text)).toContain("Merge or close PR #14");
+    expect(String(undelivered[0].reason)).toContain("504");
+  });
+
+  it("stays quiet when at least one chat got it", async () => {
+    // A partial delivery is a delivery. A second copy elsewhere is noise.
+    const { undelivered, sent, escalate } = await setup({
+      config: { allowedChatIds: [CHAT_ID, OTHER_CHAT_ID] },
+      responder: (call) => (call === 1 ? new Response("{}", { status: 200 }) : dead()),
+    });
+    await escalate();
+    expect(sent).toHaveLength(2);
+    expect(undelivered).toEqual([]);
+  });
+
+  it("emits nothing when the plugin was never going to send", async () => {
+    // Silenced by config is not the same as undeliverable.
+    const { undelivered, escalate } = await setup({ config: { allowedChatIds: [] } });
+    await escalate();
+    expect(undelivered).toEqual([]);
+  });
+
+  it("still emits for a run failure that names no task", async () => {
+    const { undelivered, failRun } = await setup({ responder: dead });
+    await failRun({ issueId: null });
+    expect(undelivered).toHaveLength(1);
+    expect(undelivered[0].issueId).toBeNull();
   });
 });

@@ -18,3 +18,14 @@ export const ESCALATION_EVENT = "plugin.paperclip-plugin-escalation.escalation-r
 /** Marker appended to every mirrored body so a human can tell what created it. */
 export const MIRROR_FOOTER =
   "_Mirrored from Paperclip. This issue is written by the mirror; edits here are not read back._";
+
+/**
+ * Emitted by the Telegram plugin when it could not deliver a message to any of
+ * its allowlisted chats. The mirror writes it onto the mirrored issue, so a
+ * notification that cannot reach a phone still reaches somewhere a human looks.
+ *
+ * The mirror knows nothing about Telegram beyond this event's shape, and the
+ * Telegram plugin knows nothing about GitHub. Same seam as escalation.
+ */
+export const TELEGRAM_UNDELIVERED_EVENT =
+  "plugin.paperclip-plugin-telegram-notify.notification-undelivered";
