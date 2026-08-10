@@ -23,6 +23,7 @@ function makeIssue(status: IssueStatus): Issue {
     parentId: null,
     workMode: "standard",
     priority: "medium",
+    reviewPolicy: null,
     assigneeAgentId: null,
     assigneeUserId: null,
     checkoutRunId: null,

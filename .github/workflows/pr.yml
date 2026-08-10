@@ -27,10 +27,17 @@ jobs:
       - name: Block manual lockfile edits
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
+          !startsWith(github.head_ref, 'sync/upstream-') &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
+          #
+          # `sync/upstream-*` is exempt: those PRs merge upstream/master into the
+          # fork's integration branch, so upstream's own lockfile arrives with the
+          # merge. Blocking it would make an upstream sync unmergeable. The property
+          # that matters — the committed lockfile agrees with the manifests — is
+          # still enforced downstream by `pnpm install --frozen-lockfile`.
           changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
