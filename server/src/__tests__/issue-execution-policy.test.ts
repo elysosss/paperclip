@@ -779,6 +779,25 @@ describe("issue execution policy transitions", () => {
     const policy = twoStagePolicy();
     const reviewStageId = policy.stages[0].id;
 
+    it("requires executor evidence before routing an agent into review", () => {
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: null,
+          },
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          commentBody: "  ",
+        }),
+      ).toThrow("requires a comment");
+    });
+
     it("approval without comment throws", () => {
       expect(() =>
         applyIssueExecutionPolicyTransition({
@@ -1721,6 +1740,7 @@ describe("issue execution policy transitions", () => {
         requestedStatus: "done",
         requestedAssigneePatch: {},
         actor: { agentId: coderAgentId },
+        commentBody: "Deployment monitor completed successfully.",
       });
 
       expect(result.patch.executionPolicy).toBeNull();

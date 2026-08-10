@@ -971,6 +971,15 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  if (
+    requestedStatus === "done" &&
+    input.policy.commentRequired &&
+    input.actor.agentId &&
+    !input.commentBody?.trim()
+  ) {
+    throw unprocessable("Completing an issue with an execution policy requires a comment");
+  }
+
   // A workflow whose execution already completed is terminal for approve/done:
   // closing the issue must not restart the chain at the first stage (#7893).
   if (requestedStatus === "done" && existingState?.status === COMPLETED_STATUS) {
