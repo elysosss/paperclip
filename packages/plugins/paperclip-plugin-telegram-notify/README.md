@@ -24,6 +24,7 @@ cached or logged), the mirror's failure discipline (every handler wrapped, failu
 | `agent.run.failed` | **Run failed** — agent, run id, truncated error | A failed run still spends the day's cap, so this means today is over, not that it will retry |
 | `budget.incident.opened` / `.resolved` | **Budget stopped work** / resolved | Money stopped, or restarted |
 | `issue.updated` → `blocked` | **Waiting for you** — task key and the unblock action | A task became somebody's to decide |
+| `issue.interaction.created` | **Waiting for you** — task key and what kind of answer is wanted | An agent asked a person directly and stopped |
 
 The spec allowed three and said a fourth needs an argument. The argument for the fourth: every
 loop in this kit that produces work for the owner terminates in a parked task — the completion
@@ -42,6 +43,23 @@ was already parked is the board being edited, not news.
 The message leads with the `unblockDescriptor.action` when there is one. "Merge or close PR #14"
 is something you can act on from a phone; "blocked" is not. When the unblock owner is a named
 user it says **Waiting for you**; when it is `board` — meaning anyone — it says **Task parked**.
+
+**Watching the board state alone was still not enough.** An agent that wants a person to decide
+something cannot park the task and name that person as the unblock owner: the board answers
+`403 Agents may only name themselves as an unblock owner`. What it does instead is open an
+issue-thread interaction — a confirmation, a question, a list of verdicts — and stop. The task's
+status never moves, so the transition above never fires, and that hand-off reached no surface at
+all ([kit #13](https://github.com/elysosss/agent-company-kit/issues/13)). `issue.interaction.created`
+is the second path to the same message. Only interactions with no `addresseeAgentId` count: one
+addressed to an agent is answered by the agent loop and is nobody's business on a phone. The
+message names the interaction *kind*, not the question — the question stays on the board.
+
+**One hand-off sends one message.** A task can produce both signals — an agent opens an
+interaction, then somebody parks the task because of it — and they are the same event. Both paths
+claim a single per-issue slot in plugin state before sending, and only the signal that claimed it
+releases it: the board path when the task leaves `blocked`, the interaction path on
+`issue.interaction.resolved`. A partial verdict submission resolves some items and leaves the
+interaction pending; the slot stays held, because nobody is off the hook yet.
 
 **The escalation event is plugin-to-plugin, and its name is namespaced**:
 `plugin.paperclip-plugin-escalation.escalation-raised`. The emitter passes the bare name; every
@@ -105,12 +123,14 @@ for ever — that is the mirror's open bug ([kit #11](https://github.com/elysoss
 and there was no reason to reproduce it here.
 
 Replay is handled for the parked-task message: the last seen status per issue is kept in plugin
-state, so a re-delivered `issue.updated` does not buzz the phone twice.
+state, so a re-delivered `issue.updated` does not buzz the phone twice. The same state holds the
+hand-off slot described above, which also makes a re-delivered `issue.interaction.created`
+harmless.
 
 ## Tests
 
 ```bash
-pnpm test        # 32, offline — no board, no network, fetch stubbed
+pnpm test        # 48, offline — no board, no network, fetch stubbed
 pnpm typecheck
 ```
 

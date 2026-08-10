@@ -80,7 +80,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         title: "Notify when a task is parked for you",
         description:
-          "The completion check parking an abandoned task, or a reviewer that will not merge. This is where every loop that produces work for you ends.",
+          "The completion check parking an abandoned task, a reviewer that will not merge, or an agent opening a question or confirmation for you. This is where every loop that produces work for you ends. One hand-off sends one message however it reaches us.",
         default: true,
       },
     },

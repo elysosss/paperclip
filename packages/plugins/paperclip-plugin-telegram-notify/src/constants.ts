@@ -20,6 +20,17 @@ export const ESCALATION_EVENT = "plugin.paperclip-plugin-escalation.escalation-r
 export const STATE_KEYS = {
   /** The status this issue was in when we last looked. */
   lastStatus: "telegram:last-status",
+  /**
+   * The hand-off we last said "waiting for you" about, or absent when the issue
+   * is not currently waiting on anyone as far as we told the operator.
+   *
+   * Two different signals mean the same hand-off — the task parking as
+   * `blocked`, and an agent opening an issue-thread interaction — and a task can
+   * produce both. One key shared by both paths is what makes a hand-off buzz the
+   * phone once. The value says which signal claimed it, so only that signal's
+   * ending clears it: `status:blocked`, or `interaction:<id>`.
+   */
+  waitingNotified: "telegram:waiting-notified",
 } as const;
 
 /**

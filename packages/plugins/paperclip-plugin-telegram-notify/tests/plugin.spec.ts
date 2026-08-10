@@ -5,7 +5,7 @@ import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
 import { ESCALATION_EVENT } from "../src/constants.js";
 import { parseConfig } from "../src/config.js";
-import { boardLink, clip, formatRunFailure, issueLabel } from "../src/format.js";
+import { boardLink, clip, formatRunFailure, formatWaitingForInteraction, issueLabel } from "../src/format.js";
 import { escapeHtml, TelegramApiError } from "../src/telegram.js";
 
 const COMPANY_ID = "c_1";
@@ -137,7 +137,48 @@ async function setup(
       ...overrides,
     } as Partial<Issue>);
 
-  return { harness, sent: telegram.sent, undelivered, escalate, failRun, park, setStatus };
+  /**
+   * The hand-off the board state cannot show: an agent that needs a person to
+   * decide something opens an issue-thread interaction and stops, because
+   * parking the task and naming that person as the unblock owner is a 403. The
+   * task's status does not move, so nothing else here fires.
+   */
+  const handoff = (payload: Record<string, unknown> = {}) =>
+    harness.emit(
+      "issue.interaction.created",
+      {
+        interactionId: "int_1",
+        interactionKind: "request_confirmation",
+        interactionStatus: "pending",
+        addresseeAgentId: null,
+        ...payload,
+      },
+      { entityId: ISSUE_ID, entityType: "issue", companyId: COMPANY_ID },
+    );
+
+  const resolveHandoff = (payload: Record<string, unknown> = {}) =>
+    harness.emit(
+      "issue.interaction.resolved",
+      {
+        interactionId: "int_1",
+        interactionKind: "request_confirmation",
+        interactionStatus: "answered",
+        ...payload,
+      },
+      { entityId: ISSUE_ID, entityType: "issue", companyId: COMPANY_ID },
+    );
+
+  return {
+    harness,
+    sent: telegram.sent,
+    undelivered,
+    escalate,
+    failRun,
+    park,
+    setStatus,
+    handoff,
+    resolveHandoff,
+  };
 }
 
 describe("the allowlist is the whole authorisation model", () => {
@@ -250,6 +291,96 @@ describe("what reaches the phone", () => {
   });
 });
 
+describe("an agent asking a person is a hand-off too", () => {
+  it("reports an interaction the agent opened for a human", async () => {
+    const { sent, handoff } = await setup();
+    await handoff();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toContain("Waiting for you");
+    expect(sent[0].text).toContain("KIT-9");
+    expect(sent[0].text).toContain("confirm");
+    expect(sent[0].text).toContain(`https://board.example/issues/${ISSUE_ID}`);
+  });
+
+  it("carries no task content on a hand-off either", async () => {
+    const { sent, handoff } = await setup();
+    await handoff({ interactionKind: "ask_user_questions" });
+    expect(sent[0].text).not.toContain("must never leave the machine");
+  });
+
+  it("says nothing about an interaction addressed to another agent", async () => {
+    // That one is answered by the agent loop; no phone is involved.
+    const { sent, handoff } = await setup();
+    await handoff({ addresseeAgentId: "agent_2" });
+    expect(sent).toEqual([]);
+  });
+
+  it("says nothing about an interaction that is already resolved", async () => {
+    const { sent, handoff } = await setup();
+    await handoff({ interactionStatus: "accepted" });
+    expect(sent).toEqual([]);
+  });
+
+  it("respects notifyWaitingForHuman", async () => {
+    const { sent, handoff } = await setup({ config: { notifyWaitingForHuman: false } });
+    await handoff();
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("one hand-off, one message", () => {
+  it("sends once when the interaction is followed by the task being parked", async () => {
+    // Both signals mean the same thing happened. The second is not news.
+    const { sent, handoff, park } = await setup();
+    await handoff();
+    await park();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toContain("Waiting for you");
+  });
+
+  it("sends once when the task is parked first and the interaction follows", async () => {
+    const { sent, park, handoff } = await setup();
+    await park();
+    await handoff();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toContain("Merge or close PR #14");
+  });
+
+  it("reports the next hand-off once the first one was answered", async () => {
+    const { sent, handoff, resolveHandoff } = await setup();
+    await handoff();
+    await resolveHandoff();
+    await handoff({ interactionId: "int_2" });
+    expect(sent).toHaveLength(2);
+  });
+
+  it("keeps the wait open when only some items got a verdict", async () => {
+    // A partial verdict submission leaves the interaction pending, so nobody is
+    // off the hook and the slot is not free for a second message.
+    const { sent, handoff, resolveHandoff } = await setup();
+    await handoff();
+    await resolveHandoff({ interactionStatus: "pending" });
+    await handoff({ interactionId: "int_2" });
+    expect(sent).toHaveLength(1);
+  });
+
+  it("reports a parking again once the interaction that claimed it was resolved", async () => {
+    const { sent, handoff, resolveHandoff, park } = await setup();
+    await handoff();
+    await resolveHandoff();
+    await park();
+    expect(sent).toHaveLength(2);
+  });
+
+  it("does not let a resolved interaction free a slot the board status holds", async () => {
+    const { sent, park, resolveHandoff, handoff } = await setup();
+    await park();
+    await resolveHandoff();
+    await handoff({ interactionId: "int_2" });
+    expect(sent).toHaveLength(1);
+  });
+});
+
 describe("each notification can be switched off alone", () => {
   it("respects notifyEscalation", async () => {
     const { sent, escalate } = await setup({ config: { notifyEscalation: false } });
@@ -344,6 +475,12 @@ describe("the pieces on their own", () => {
     expect(clip("a\n\n  b", 10)).toBe("a b");
     expect(clip("x".repeat(50), 10)).toHaveLength(10);
     expect(clip("x".repeat(50), 10).endsWith("…")).toBe(true);
+  });
+
+  it("names the ask by kind, and stays vague about a kind it does not know", () => {
+    const base = { issue: null, issueId: "iss_1", link: null };
+    expect(formatWaitingForInteraction({ ...base, kind: "ask_user_questions" })).toContain("asked you a question");
+    expect(formatWaitingForInteraction({ ...base, kind: "invented_later" })).toContain("waiting on you");
   });
 
   it("falls back to the bare id when the board gave us nothing", () => {

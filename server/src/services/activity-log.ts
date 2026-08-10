@@ -19,6 +19,26 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   issue_document_updated: "issue.document.updated",
   issue_document_deleted: "issue.document.deleted",
   issue_blockers_updated: "issue.relations.updated",
+  // An issue-thread interaction is how an agent hands a task to a human: it
+  // cannot park the task as `blocked` and name a person as the unblock owner
+  // (that is a 403), so the interaction is the hand-off. Every way one ends
+  // collapses to a single `resolved` event, the same shape the three approval
+  // decisions already collapse to `approval.decided`: a subscriber that showed
+  // "waiting for you" only needs to know the wait is over, not which of the
+  // seven exits it took. The exit itself stays in `payload.interactionStatus`.
+  //
+  // `item_verdicts_submitted` is in the resolved set even though a partial
+  // submission leaves the interaction pending — `payload.interactionStatus` is
+  // authoritative, and splitting it out would give subscribers a second event
+  // name to learn for the same lifecycle.
+  issue_thread_interaction_created: "issue.interaction.created",
+  issue_thread_interaction_accepted: "issue.interaction.resolved",
+  issue_thread_interaction_rejected: "issue.interaction.resolved",
+  issue_thread_interaction_answered: "issue.interaction.resolved",
+  issue_thread_interaction_item_verdicts_submitted: "issue.interaction.resolved",
+  issue_thread_interaction_withdrawn: "issue.interaction.resolved",
+  issue_thread_interaction_cancelled: "issue.interaction.resolved",
+  issue_thread_interaction_expired: "issue.interaction.resolved",
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
