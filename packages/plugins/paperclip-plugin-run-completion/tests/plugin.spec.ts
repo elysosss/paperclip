@@ -31,6 +31,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     parentId: null,
     workMode: "standard",
     priority: "medium",
+    reviewPolicy: null,
     assigneeAgentId: "agent_1",
     assigneeUserId: null,
     checkoutRunId: null,
