@@ -7,7 +7,22 @@ import {
 } from "@paperclipai/plugin-sdk";
 import type { IssueStatus } from "@paperclipai/shared";
 import { GithubApiError, GithubClient } from "./github.js";
-import { ESCALATION_EVENT, STATE_KEYS, TELEGRAM_UNDELIVERED_EVENT } from "./constants.js";
+import {
+  ESCALATION_EVENT,
+  OUTBOX_DRAIN_JOB,
+  OUTBOX_STATUS,
+  STATE_KEYS,
+  TELEGRAM_UNDELIVERED_EVENT,
+} from "./constants.js";
+import {
+  drainOutbox,
+  findCreateRecord,
+  issueScope,
+  readMirroredNumber,
+  recordIntent,
+  recordMirrored,
+  recordUncertain,
+} from "./outbox.js";
 import {
   formatBody,
   formatBudgetComment,
@@ -56,15 +71,6 @@ async function clientFor(
   });
 }
 
-function issueScope(issueId: string) {
-  return { scopeKind: "issue" as const, scopeId: issueId };
-}
-
-async function readMirroredNumber(ctx: PluginContext, issueId: string): Promise<number | null> {
-  const stored = await ctx.state.get({ ...issueScope(issueId), stateKey: STATE_KEYS.mirroredNumber });
-  return typeof stored === "number" ? stored : null;
-}
-
 /**
  * Handlers must never take the worker down: a GitHub outage or a revoked token
  * is an observability problem, not a reason to stop processing Paperclip events.
@@ -100,7 +106,12 @@ const plugin = definePlugin({
       }
     };
 
-    /** Creates the GitHub issue once and remembers its number. Idempotent. */
+    /**
+     * Creates the GitHub issue once and remembers its number. Idempotent, and
+     * where it cannot be idempotent it refuses rather than guesses — see
+     * `outbox.ts` for why a create is the one step that must be written down
+     * before it is attempted.
+     */
     const ensureMirrored = async (event: PluginEvent): Promise<void> => {
       const issueId = event.entityId;
       if (!issueId) return;
@@ -109,8 +120,25 @@ const plugin = definePlugin({
         if (!config) return;
         if (await readMirroredNumber(ctx, issueId)) return;
 
+        // No number in state, but a record of an earlier attempt: that attempt
+        // may already have created the issue. Posting again would duplicate it,
+        // and the mirror will not read GitHub back to find out which it is.
+        const attempted = await findCreateRecord(ctx, event.companyId, issueId);
+        if (attempted) {
+          if (attempted.status === OUTBOX_STATUS.pending) {
+            await recordUncertain(ctx, attempted);
+            ctx.logger.error(
+              "GitHub mirror: an earlier create was never confirmed — refusing to create a second issue",
+              { issueId, companyId: event.companyId },
+            );
+          }
+          return;
+        }
+
         const issue = await ctx.issues.get(issueId, event.companyId);
         if (!issue) return;
+
+        const intent = await recordIntent(ctx, event.companyId, issueId, formatTitle(issue));
 
         const github = await clientFor(ctx, event.companyId, config);
         const created = await github.createIssue({
@@ -119,6 +147,8 @@ const plugin = definePlugin({
           labels: [statusLabel(issue.status)],
         });
 
+        // State first: it is what every later handler reads. The outbox record
+        // is closed after, and the drain repairs the gap if we die in between.
         await ctx.state.set(
           { ...issueScope(issueId), stateKey: STATE_KEYS.mirroredNumber },
           created.number,
@@ -127,6 +157,8 @@ const plugin = definePlugin({
           { ...issueScope(issueId), stateKey: STATE_KEYS.lastStatus },
           issue.status,
         );
+        await recordMirrored(ctx, intent, created.number);
+
         ctx.logger.info("Mirrored Paperclip issue to GitHub", {
           issueId,
           githubIssue: created.number,
@@ -281,6 +313,12 @@ const plugin = definePlugin({
           }),
         );
       }),
+    );
+
+    // Resolves creates that were interrupted between the POST and the state
+    // write. Plugin-local only: it reads state and entities, never GitHub.
+    ctx.jobs.register(OUTBOX_DRAIN_JOB, () =>
+      guard(ctx, OUTBOX_DRAIN_JOB, () => drainOutbox(ctx)),
     );
 
     ctx.logger.info("GitHub mirror ready");

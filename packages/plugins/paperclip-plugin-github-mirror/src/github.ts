@@ -3,8 +3,30 @@
  *
  * Deliberately write-only: the mirror never reads GitHub state back into
  * Paperclip, so there is no `get`/`list` here. Paperclip stays the store of
- * record; GitHub is a viewing surface.
+ * record; GitHub is a viewing surface. Retry does not change that: a failed
+ * write is tried again, never read back to find out what happened.
+ *
+ * ## The 30s budget
+ *
+ * A plugin cannot cancel its own request. `ctx.http.fetch` is a JSON-RPC call
+ * whose `init` is serialized down to method, headers and body, so an
+ * `AbortSignal` passed here would be silently dropped and a `Promise.race`
+ * around the await would only shorten the plugin's wait while the host socket
+ * kept running.
+ *
+ * It does not need one. Every call is already bounded twice at 30 seconds:
+ *
+ * - worker side, the SDK's `callHost` timer (`DEFAULT_RPC_TIMEOUT_MS` in
+ *   `worker-rpc-host.ts`; `runWorker` never passes `rpcTimeoutMs`), which
+ *   rejects with a JSON-RPC timeout;
+ * - host side, an `AbortController` armed with `PLUGIN_FETCH_TIMEOUT_MS`
+ *   (`plugin-host-services.ts`), which aborts the socket itself.
+ *
+ * So the ceiling is the runtime's, not ours, and the only thing this file owes
+ * it is that retrying stays inside it — see `RETRY_BUDGET_MS` in `retry.ts`.
  */
+
+import { withRetry, type RetryDeps } from "./retry.js";
 
 export interface GithubClientOptions {
   /** `owner/repo`. */
@@ -13,6 +35,8 @@ export interface GithubClientOptions {
   token: string;
   fetchImpl: (url: string, init?: RequestInit) => Promise<Response>;
   apiBaseUrl?: string;
+  /** Retry timing seams. Tests inject them; production uses the defaults. */
+  retryDeps?: Partial<RetryDeps>;
 }
 
 export interface GithubIssueRef {
@@ -29,10 +53,40 @@ export class GithubApiError extends Error {
     readonly status: number,
     /** True when GitHub asked us to back off rather than rejecting the request outright. */
     readonly retryable: boolean,
+    /**
+     * How long GitHub asked us to wait, in ms, when it said so via
+     * `retry-after` or `x-ratelimit-reset`. `null` when it did not.
+     */
+    readonly retryAfterMs: number | null = null,
   ) {
     super(message);
     this.name = "GithubApiError";
   }
+}
+
+/**
+ * GitHub names a wait in one of two ways: `retry-after` (seconds, on secondary
+ * rate limits and abuse detection) or `x-ratelimit-reset` (epoch seconds, on
+ * primary rate limits). Anything absent, unparseable, or in the past yields
+ * `null`, and the caller falls back to its own backoff.
+ */
+function parseRetryAfterMs(headers: Headers, nowMs: number): number | null {
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  }
+
+  const reset = headers.get("x-ratelimit-reset");
+  if (reset) {
+    const resetSeconds = Number(reset);
+    if (Number.isFinite(resetSeconds)) {
+      const waitMs = resetSeconds * 1000 - nowMs;
+      if (waitMs > 0) return Math.round(waitMs);
+    }
+  }
+
+  return null;
 }
 
 /** `owner/repo` → validated parts. Throws on anything else so a typo fails loudly at setup. */
@@ -56,7 +110,17 @@ export class GithubClient {
     this.apiBaseUrl = options.apiBaseUrl ?? DEFAULT_API_BASE;
   }
 
+  /**
+   * One write, retried on the failures that can succeed on a second try. The
+   * retry lives here rather than in the handlers so every call gets it, and so
+   * a handler that ends up in `guard` has genuinely exhausted its options
+   * rather than given up on the first 502.
+   */
   private async request<T>(path: string, init: RequestInit): Promise<T> {
+    return withRetry(() => this.attempt<T>(path, init), this.options.retryDeps);
+  }
+
+  private async attempt<T>(path: string, init: RequestInit): Promise<T> {
     const response = await this.options.fetchImpl(`${this.apiBaseUrl}${path}`, {
       ...init,
       headers: {
@@ -83,6 +147,7 @@ export class GithubClient {
         `GitHub ${init.method ?? "GET"} ${path} failed: ${response.status} ${detail.slice(0, 300)}`,
         response.status,
         rateLimited || response.status >= 500,
+        parseRetryAfterMs(response.headers, Date.now()),
       );
     }
 
