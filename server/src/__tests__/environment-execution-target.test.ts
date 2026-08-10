@@ -10,6 +10,7 @@ vi.mock("../services/environment-config.js", () => ({
 
 import {
   measureStartupStep,
+  runWithoutActiveStep,
   SANDBOX_STARTUP_SPAN_ATTRS,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import {
@@ -56,6 +57,42 @@ function createRecordingTrace() {
   };
   const contextWithSpan = (span: unknown) => ({ span });
   return { tracer, contextWithSpan, spans };
+}
+
+// A fake tracer that records the third `startSpan` argument — the parent-context
+// token — for each span, keyed by the span name. `contextWithSpan` wraps a span
+// in a token and keeps that token, so a test asserts the exact token identity,
+// not a rebuilt copy. The exec seam reads the parent-context token from the
+// active step store and passes it as the third `startSpan` argument. This helper
+// holds the parent assertion in one place for reuse.
+function recordParentContext() {
+  const calls: Array<{ name: string; parentContext: unknown; span: unknown }> = [];
+  const tokens = new Map<unknown, unknown>();
+  const tracer = {
+    startSpan(name: string, _options?: unknown, parentContext?: unknown) {
+      const span = {
+        name,
+        setAttribute(_key: string, _value: unknown) {},
+        setStatus(_status: { code: number; message?: string }) {},
+        end() {},
+      };
+      calls.push({ name, parentContext, span });
+      return span;
+    },
+  };
+  const contextWithSpan = (span: unknown) => {
+    const token = { span };
+    tokens.set(span, token);
+    return token;
+  };
+  // The span object recorded for a given span name.
+  const spanNamed = (name: string) => calls.find((call) => call.name === name)?.span;
+  // The parent-context token that `startSpan` received for a given span name.
+  const parentContextFor = (name: string) =>
+    calls.find((call) => call.name === name)?.parentContext;
+  // The parent-context token that `contextWithSpan` returned for a given span.
+  const tokenForSpan = (span: unknown) => tokens.get(span);
+  return { tracer, contextWithSpan, calls, spanNamed, parentContextFor, tokenForSpan };
 }
 
 describe("resolveEnvironmentExecutionTarget", () => {
@@ -367,7 +404,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(target).not.toHaveProperty("paperclipApiUrl");
   });
 
-  it("exposes a sandbox runner that counts round-trips and accumulates provider durations", async () => {
+  it("exposes a sandbox runner with single-stream stdin upload disabled", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",
       config: {
@@ -377,8 +414,6 @@ describe("resolveEnvironmentExecutionTarget", () => {
       },
     });
 
-    // Each exec reports its provider-boundary durations on the free-form result
-    // metadata (the Daytona plugin does this); the runner accumulates them.
     const environmentRuntime = {
       execute: vi.fn().mockResolvedValue({
         exitCode: 0,
@@ -404,31 +439,28 @@ describe("resolveEnvironmentExecutionTarget", () => {
 
     const runner = (target as { runner?: {
       supportsSingleStreamStdinProgress?: boolean;
-      execCount(): number;
-      providerExecMs(): number;
-      providerGetMs(): number;
       execute(input: { command: string; args?: string[] }): Promise<unknown>;
     } }).runner;
     expect(runner).toBeTruthy();
-    // Single-stream stdin upload is enabled (research A1 / PAP-3159 #2): a
-    // ≤96 MiB writeFile collapses to one round-trip.
+    // Provider-backed sandbox RPCs do not surface bounded mid-stream progress
+    // for a single stdin upload, so the runner leaves the capability disabled.
     expect(runner!.supportsSingleStreamStdinProgress).toBe(false);
-    expect(runner!.execCount()).toBe(0);
-    expect(runner!.providerExecMs()).toBe(0);
-    expect(runner!.providerGetMs()).toBe(0);
 
+    // The exec seam still runs each command; the run-log no longer carries the
+    // detailed per-step round-trip or provider-duration counts.
     await runner!.execute({ command: "echo", args: ["a"] });
     await runner!.execute({ command: "echo", args: ["b"] });
-
-    expect(runner!.execCount()).toBe(2);
-    expect(runner!.providerExecMs()).toBe(1200);
-    expect(runner!.providerGetMs()).toBe(30);
+    expect(environmentRuntime.execute).toHaveBeenCalledTimes(2);
   });
 
-  it("tolerates a provider result with no timing metadata (counts the round-trip, accumulates nothing)", async () => {
+  it("forwards the session flags to the environment runtime execute", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",
-      config: { provider: "fake-plugin", reuseLease: false, timeoutMs: 30_000 },
+      config: {
+        provider: "fake-plugin",
+        reuseLease: false,
+        timeoutMs: 30_000,
+      },
     });
 
     const environmentRuntime = {
@@ -436,8 +468,9 @@ describe("resolveEnvironmentExecutionTarget", () => {
         exitCode: 0,
         signal: null,
         timedOut: false,
-        stdout: "",
+        stdout: "ok",
         stderr: "",
+        metadata: { durationMs: 600, getDurationMs: 15 },
       }),
       supportsSync: vi.fn().mockReturnValue(false),
     };
@@ -454,16 +487,34 @@ describe("resolveEnvironmentExecutionTarget", () => {
     });
 
     const runner = (target as { runner?: {
-      execCount(): number;
-      providerExecMs(): number;
-      providerGetMs(): number;
-      execute(input: { command: string }): Promise<unknown>;
-    } }).runner;
-    await runner!.execute({ command: "echo" });
+      execute(input: {
+        command: string;
+        args?: string[];
+        useSession?: boolean;
+        bypassSession?: boolean;
+      }): Promise<unknown>;
+    } }).runner!;
 
-    expect(runner!.execCount()).toBe(1);
-    expect(runner!.providerExecMs()).toBe(0);
-    expect(runner!.providerGetMs()).toBe(0);
+    // The agent command opts onto the persistent session with `useSession`,
+    // which the seam maps to `forceSession`. It never bypasses the session.
+    await runner.execute({ command: "node", args: ["script.js"], useSession: true });
+    // A bridge control-plane exec opts off the persistent session with
+    // `bypassSession`, which the seam forwards unchanged.
+    await runner.execute({ command: "sh", args: ["-c", "cat"], bypassSession: true });
+
+    const first = environmentRuntime.execute.mock.calls[0]![0] as {
+      forceSession?: boolean;
+      bypassSession?: boolean;
+    };
+    expect(first.forceSession).toBe(true);
+    expect(first.bypassSession).toBeUndefined();
+
+    const second = environmentRuntime.execute.mock.calls[1]![0] as {
+      forceSession?: boolean;
+      bypassSession?: boolean;
+    };
+    expect(second.forceSession).toBeUndefined();
+    expect(second.bypassSession).toBe(true);
   });
 
   // A recording tracer that captures each provider-exec span's name, attribute
@@ -515,6 +566,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
     A.execSandboxMs,
     A.execNetworkMs,
     A.execCriticalPath,
+    A.execCacheHit,
     A.outcome,
   ]);
 
@@ -561,6 +613,122 @@ describe("resolveEnvironmentExecutionTarget", () => {
     } }).runner!;
   }
 
+  // Run the sandbox runner's execute with an incremental log sink and collect
+  // the ordered deliveries. The runner's execute accepts an `onLog`, so this
+  // casts past the narrowed helper return type.
+  async function runExecuteCollectingLogs(
+    runner: { execute(input: unknown): Promise<unknown> },
+  ): Promise<Array<[string, string]>> {
+    const delivered: Array<[string, string]> = [];
+    await runner.execute({
+      command: "echo",
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        delivered.push([stream, chunk]);
+      },
+    });
+    return delivered;
+  }
+
+  it("delivers only the un-streamed suffix after a provider streams a prefix then polls the complete result", async () => {
+    // The provider streams a prefix through the incremental sink, then its
+    // stream fails and it polls the complete output as the final result. The
+    // reconciler must deliver the remaining tail once, so no output byte is lost
+    // or repeated.
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: async (input: unknown) => {
+        const typed = input as { onLog?: (s: "stdout" | "stderr", c: string) => Promise<void> };
+        await typed.onLog?.("stdout", "hello ");
+        await typed.onLog?.("stderr", "warn:");
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "hello world", stderr: "warn:done" };
+      },
+    });
+    const delivered = await runExecuteCollectingLogs(
+      runner as { execute(input: unknown): Promise<unknown> },
+    );
+    expect(delivered).toEqual([
+      ["stdout", "hello "],
+      ["stderr", "warn:"],
+      ["stdout", "world"],
+      ["stderr", "done"],
+    ]);
+  });
+
+  it("does not repeat output when the provider already streamed the complete result", async () => {
+    // The provider streams the whole output through the incremental sink and
+    // returns the same complete result. The suffix is empty, so the reconciler
+    // never re-delivers the streamed bytes.
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: async (input: unknown) => {
+        const typed = input as { onLog?: (s: "stdout" | "stderr", c: string) => Promise<void> };
+        await typed.onLog?.("stdout", "full");
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "full", stderr: "" };
+      },
+    });
+    const delivered = await runExecuteCollectingLogs(
+      runner as { execute(input: unknown): Promise<unknown> },
+    );
+    expect(delivered).toEqual([["stdout", "full"]]);
+  });
+
+  it("delivers the full captured output when the provider streams nothing incrementally", async () => {
+    // The provider streams no incremental chunk, so the whole final result is
+    // the suffix and reaches the sink once.
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "batch-out",
+        stderr: "batch-err",
+      }),
+    });
+    const delivered = await runExecuteCollectingLogs(
+      runner as { execute(input: unknown): Promise<unknown> },
+    );
+    expect(delivered).toEqual([
+      ["stdout", "batch-out"],
+      ["stderr", "batch-err"],
+    ]);
+  });
+
+  it("delivers the whole final output when the poll fallback buffer does not continue the streamed prefix", async () => {
+    // The provider streams a prefix, then its stream fails and it polls a
+    // buffer that does NOT start with that prefix. A length slice would drop
+    // the leading bytes of the poll buffer and corrupt the durable log, so the
+    // reconciler delivers the whole final output instead. The streamed prefix
+    // repeats, but no output byte is lost or truncated.
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: async (input: unknown) => {
+        const typed = input as { onLog?: (s: "stdout" | "stderr", c: string) => Promise<void> };
+        await typed.onLog?.("stdout", "hello ");
+        await typed.onLog?.("stderr", "warn:");
+        // The poll buffer starts with different leading text on both streams.
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "RESYNCED output", stderr: "RESET err" };
+      },
+    });
+    const delivered = await runExecuteCollectingLogs(
+      runner as { execute(input: unknown): Promise<unknown> },
+    );
+    expect(delivered).toEqual([
+      ["stdout", "hello "],
+      ["stderr", "warn:"],
+      ["stdout", "RESYNCED output"],
+      ["stderr", "RESET err"],
+    ]);
+  });
+
   it("sets the provider duration attributes from finite Daytona-shaped metadata", async () => {
     const { tracer, spans } = createRecordingExecTracer();
     const runner = await runnerFor({
@@ -596,6 +764,50 @@ describe("resolveEnvironmentExecutionTarget", () => {
     // The wall time is a real, finite, non-negative number.
     expect(typeof span.attributes[A.execWallMs]).toBe("number");
     expect(span.attributes[A.execWallMs] as number).toBeGreaterThanOrEqual(0);
+  });
+
+  it("carries the explicit exec cache_hit from result.metadata.cacheHit", async () => {
+    const { tracer, spans } = createRecordingExecTracer();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "ok",
+        stderr: "",
+        metadata: { durationMs: 600, getDurationMs: 0, cacheHit: true },
+      },
+      tracer,
+    });
+
+    await runner.execute({ command: "echo", args: ["a"] });
+
+    const span = spans[0]!;
+    // The flag comes from the metadata boolean, not from a zero handle-fetch.
+    expect(span.attributes[A.execCacheHit]).toBe(true);
+  });
+
+  it("omits exec cache_hit when the provider reports no cacheHit metadata", async () => {
+    const { tracer, spans } = createRecordingExecTracer();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "ok",
+        stderr: "",
+        metadata: { durationMs: 600, getDurationMs: 15 },
+      },
+      tracer,
+    });
+
+    await runner.execute({ command: "echo", args: ["a"] });
+
+    const span = spans[0]!;
+    // A provider that omits the boolean yields no attribute — never `false`.
+    expect(span.attributes).not.toHaveProperty(A.execCacheHit);
   });
 
   it("omits each duration attribute when a provider returns no timing (does not throw, keeps provider)", async () => {
@@ -760,6 +972,68 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(execSpan!.parent).toBeNull();
   });
 
+  // The three baseline tests below record the third `startSpan` argument — the
+  // parent-context token — and assert its identity. They pin the current exec
+  // parenting so a later phase that re-points the exec parent has a fixed
+  // reference point.
+  it("test_exec_inside_measured_step_parents_to_step_context", async () => {
+    const rec = recordParentContext();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" },
+      tracer: rec.tracer,
+    });
+
+    // Run the seam `execute` inside one measured step. The step publishes its
+    // child context to the active step store, so the seam reads it and passes it
+    // as the third `startSpan` argument for the exec span.
+    await measureStartupStep({}, () => 0, "stage.sync", () => runner.execute({ command: "echo" }), {
+      tracer: rec.tracer,
+      contextWithSpan: rec.contextWithSpan,
+    });
+
+    const stepSpan = rec.spanNamed("stage.sync");
+    expect(stepSpan).toBeTruthy();
+    // The exec span parents to the step span. The third `startSpan` argument is
+    // the exact parent-context token that `contextWithSpan` built for the step
+    // span, not a rebuilt copy.
+    expect(rec.parentContextFor("sandbox.exec")).toBe(rec.tokenForSpan(stepSpan));
+  });
+
+  it("test_exec_in_root_region_is_unparented_today", async () => {
+    const rec = recordParentContext();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" },
+      tracer: rec.tracer,
+    });
+
+    // No measured step wraps the exec, so the active step store is empty. The
+    // seam reads no parent and passes `undefined` as the third `startSpan`
+    // argument. The exec span opens unparented today.
+    await runner.execute({ command: "echo" });
+
+    expect(rec.spanNamed("sandbox.exec")).toBeTruthy();
+    expect(rec.parentContextFor("sandbox.exec")).toBeUndefined();
+  });
+
+  it("test_exec_on_runWithoutActiveStep_is_unparented_today", async () => {
+    const rec = recordParentContext();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" },
+      tracer: rec.tracer,
+    });
+
+    // `runWithoutActiveStep` empties the active step store for the wrapped work.
+    // The seam reads no parent and passes `undefined` as the third `startSpan`
+    // argument. The exec span opens unparented today.
+    await runWithoutActiveStep(() => runner.execute({ command: "echo" }));
+
+    expect(rec.spanNamed("sandbox.exec")).toBeTruthy();
+    expect(rec.parentContextFor("sandbox.exec")).toBeUndefined();
+  });
+
   it("opens the exec span before the provider await so the span wraps the execution", async () => {
     const { tracer, spans } = createRecordingExecTracer();
     // Assert the span is already open (started, not ended) while the provider
@@ -851,5 +1125,249 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(span!.attributes[A.execExitCode]).toBe(0);
     // The seam reached the log callback exactly once (the stdout delivery).
     expect(onLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers incremental logs before the final result and does not duplicate them", async () => {
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: vi.fn(async (input: { onLog?: (s: string, c: string) => Promise<void> }) => {
+        // The provider streams the output while the command runs.
+        await input.onLog?.("stdout", "chunk-1");
+        await input.onLog?.("stderr", "chunk-2");
+        await input.onLog?.("stdout", "chunk-3");
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "chunk-1chunk-3",
+          stderr: "chunk-2",
+        };
+      }),
+    });
+
+    const onLog = vi.fn();
+    const result = await (runner as {
+      execute(input: unknown): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+    }).execute({ command: "echo", onLog });
+
+    // The runner receives the incremental chunks in order, and NOT a repeated
+    // delivery of the final stdout/stderr.
+    expect(onLog.mock.calls).toEqual([
+      ["stdout", "chunk-1"],
+      ["stderr", "chunk-2"],
+      ["stdout", "chunk-3"],
+    ]);
+    // The final result stays available to the caller for parsing and fallback.
+    expect(result).toMatchObject({ exitCode: 0, stdout: "chunk-1chunk-3", stderr: "chunk-2" });
+  });
+
+  it("still delivers the final result to the runner when the provider does not stream", async () => {
+    const { tracer } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      // A provider that never calls onLog returns only the final result.
+      execute: vi.fn(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "final-out",
+        stderr: "final-err",
+      })),
+    });
+
+    const onLog = vi.fn();
+    const result = await (runner as {
+      execute(input: unknown): Promise<{ stdout: string; stderr: string }>;
+    }).execute({ command: "echo", onLog });
+
+    expect(onLog.mock.calls).toEqual([
+      ["stdout", "final-out"],
+      ["stderr", "final-err"],
+    ]);
+    expect(result).toMatchObject({ stdout: "final-out", stderr: "final-err" });
+  });
+
+  it("creates exactly one sandbox.exec span for one streamed provider call", async () => {
+    const { tracer, spans } = createRecordingExecTracer();
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: vi.fn(async (input: { onLog?: (s: string, c: string) => Promise<void> }) => {
+        await input.onLog?.("stdout", "chunk-a");
+        await input.onLog?.("stdout", "chunk-b");
+        await input.onLog?.("stderr", "chunk-c");
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "chunk-achunk-b",
+          stderr: "chunk-c",
+        };
+      }),
+    });
+
+    const onLog = vi.fn();
+    await (runner as { execute(input: unknown): Promise<unknown> }).execute({
+      command: "echo",
+      onLog,
+    });
+
+    // One long-lived provider call opens one span; each stream chunk opens none.
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.name).toBe("sandbox.exec");
+    expect(spans[0]!.ended).toBe(true);
+  });
+
+  it("keeps streamed log text and secret values out of span attributes", async () => {
+    const { tracer, spans } = createRecordingExecTracer();
+    const secret = "sk-super-secret-value";
+    const runner = await runnerWithExecute({
+      provider: "daytona",
+      tracer,
+      execute: vi.fn(async (input: { onLog?: (s: string, c: string) => Promise<void> }) => {
+        await input.onLog?.("stdout", `token=${secret}\n`);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: `token=${secret}\n`,
+          stderr: "",
+        };
+      }),
+    });
+
+    const onLog = vi.fn();
+    // The secret rides the env and the streamed chunk, never the command label.
+    await (runner as { execute(input: unknown): Promise<unknown> }).execute({
+      command: "run-agent",
+      env: { API_KEY: secret },
+      onLog,
+    });
+
+    expect(spans).toHaveLength(1);
+    const span = spans[0]!;
+    // Attributes carry only the closed allowlist — never log text or secrets.
+    for (const key of Object.keys(span.attributes)) {
+      expect(ALLOWED_EXEC_SPAN_ATTRIBUTE_KEYS.has(key), `non-allowlisted key "${key}"`).toBe(true);
+    }
+    const serialized = JSON.stringify(span.attributes);
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain("token=");
+    expect(serialized).not.toContain("chunk");
+  });
+
+  // Fire one run-time exec from a bridge continuation that runs after the step
+  // span ended. Each bridge step (`bridge.paperclip`, `bridge.process-session`)
+  // starts long-lived work with `criticalPath: false`. The bridge boundary wraps
+  // that long-lived work in `runWithoutActiveStep`, exactly as modeled here, so
+  // the continuation reads an empty active step. Return the recorded exec span.
+  async function runContinuationExec(step: string, options: { wrap: boolean }) {
+    const { tracer, contextWithSpan, spans } = createRecordingTrace();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" },
+      tracer,
+    });
+
+    let resolveExec!: () => void;
+    const execDone = new Promise<void>((resolve) => {
+      resolveExec = resolve;
+    });
+
+    // Schedule the exec from a timer inside the step body, so it fires after the
+    // step span ends. The `wrap` flag models the fix: when true, the boundary
+    // wraps the long-lived work in `runWithoutActiveStep`; when false, it models
+    // the pre-fix leak.
+    const scheduleContinuation = () => {
+      setTimeout(() => {
+        void runner.execute({ command: "echo" }).then(() => resolveExec());
+      }, 0);
+    };
+
+    await measureStartupStep(
+      {},
+      () => 0,
+      step,
+      async () => {
+        if (options.wrap) {
+          runWithoutActiveStep(scheduleContinuation);
+        } else {
+          scheduleContinuation();
+        }
+        return "started";
+      },
+      { tracer, contextWithSpan, criticalPath: false },
+    );
+
+    await execDone;
+    return spans.find((span) => span.name === "sandbox.exec");
+  }
+
+  it("opens an unparented exec span for a process-session bridge continuation", async () => {
+    const execSpan = await runContinuationExec("bridge.process-session", { wrap: true });
+    expect(execSpan).toBeTruthy();
+    // The step span ended and the boundary emptied the store, so the continuation
+    // exec opens a root span, not one under the dead bridge step.
+    expect(execSpan!.parent).toBeNull();
+  });
+
+  it("opens an unparented exec span for a paperclip bridge continuation", async () => {
+    const execSpan = await runContinuationExec("bridge.paperclip", { wrap: true });
+    expect(execSpan).toBeTruthy();
+    expect(execSpan!.parent).toBeNull();
+  });
+
+  it("does not copy the stale criticalPath = false flag onto a continuation exec", async () => {
+    const execSpan = await runContinuationExec("bridge.process-session", { wrap: true });
+    expect(execSpan).toBeTruthy();
+    // The bridge step set `criticalPath: false`. The continuation reads an empty
+    // store, so the exec span records the default `true`, never the stale `false`.
+    expect(execSpan!.attributes[A.execCriticalPath]).toBe(true);
+    expect(execSpan!.attributes[A.execCriticalPath]).not.toBe(false);
+  });
+
+  it("leaks the ended step onto a continuation exec without the boundary wrap", async () => {
+    // The mechanism guard: an unwrapped continuation keeps the ended bridge step
+    // store, so the exec span parents to the dead step and copies its
+    // `criticalPath: false`. The boundary wrap in the two tests above removes both
+    // defects, so this suite fails if a future edit drops the wrap.
+    const { tracer, contextWithSpan, spans } = createRecordingTrace();
+    const runner = await runnerFor({
+      provider: "daytona",
+      execResult: { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" },
+      tracer,
+    });
+
+    let resolveExec!: () => void;
+    const execDone = new Promise<void>((resolve) => {
+      resolveExec = resolve;
+    });
+
+    await measureStartupStep(
+      {},
+      () => 0,
+      "bridge.process-session",
+      async () => {
+        setTimeout(() => {
+          void runner.execute({ command: "echo" }).then(() => resolveExec());
+        }, 0);
+        return "started";
+      },
+      { tracer, contextWithSpan, criticalPath: false },
+    );
+
+    await execDone;
+
+    const stepSpan = spans.find((span) => span.name === "bridge.process-session");
+    const execSpan = spans.find((span) => span.name === "sandbox.exec");
+    expect(stepSpan).toBeTruthy();
+    expect(execSpan).toBeTruthy();
+    // The unwrapped continuation parents the exec span to the ended step and
+    // copies the stale flag.
+    expect(execSpan!.parent).toBe(stepSpan);
+    expect(execSpan!.attributes[A.execCriticalPath]).toBe(false);
   });
 });

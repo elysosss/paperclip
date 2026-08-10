@@ -62,6 +62,35 @@ function toFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** Read a free-form metadata value as a boolean, or `undefined`. The provider
+ * cache-hit flag rides the exec result's untyped `metadata`, so a provider that
+ * omits or mistypes it yields no attribute — never a misleading `false`. */
+function toBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/**
+ * Compute the tail of `final` that the provider did NOT already stream.
+ *
+ * The provider streams output chunks in order. Those chunks form `delivered`.
+ * The final result is `final`. In the normal path `final` continues
+ * `delivered`, so the tail is `final` past the delivered length.
+ *
+ * A provider can stream a prefix and then fall back to a poll that returns a
+ * different buffer. When `final` does not start with `delivered`, a length
+ * slice would drop unrelated leading output or cut a chunk mid-text, so the
+ * durable log would hold truncated or corrupt output. In that case this
+ * function returns the whole `final` instead. That can repeat the streamed
+ * prefix in the log, but the complete final output always reaches the log.
+ * Repetition is safer than a silent loss of output.
+ */
+function undeliveredSuffix(delivered: string, final: string): string {
+  if (!final) return "";
+  if (delivered.length === 0) return final;
+  if (final.startsWith(delivered)) return final.slice(delivered.length);
+  return final;
+}
+
 /**
  * The closed input for one `sandbox.exec` span. The seam builds it from the
  * exec result and the active step context. Every field is already bounded or
@@ -82,6 +111,8 @@ interface SandboxExecSpanInput {
   sandboxMs: number | undefined;
   /** Whether the execution sits on the startup critical path. */
   criticalPath: boolean;
+  /** Whether the provider served the sandbox handle from its warm cache. */
+  cacheHit: boolean | undefined;
 }
 
 /**
@@ -111,6 +142,13 @@ function setSandboxExecSpanAttributes(span: ExecSpan, input: SandboxExecSpanInpu
     setFiniteNumberAttr(span, A.execNetworkMs, input.wallMs - input.waitBeforeMs - input.sandboxMs);
   }
   span.setAttribute(A.execCriticalPath, input.criticalPath);
+  // The explicit provider cache-hit flag, from `result.metadata.cacheHit`. The
+  // plugin decides it at the handle lookup, so the span no longer infers a
+  // cache hit from `wait_before_ms == 0`. A provider that omits it yields no
+  // attribute.
+  if (typeof input.cacheHit === "boolean") {
+    span.setAttribute(A.execCacheHit, input.cacheHit);
+  }
   const failed = input.exitCode !== 0;
   span.setAttribute(
     A.outcome,
@@ -198,20 +236,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
         ? input.leaseMetadata.shellCommand
         : null;
 
-    // Per-lease-runner cumulative counters for startup-step attribution (Open
-    // Q1). Closed over by the `runner.execute` seam below and read back as
-    // deltas by `measureStartupStep`.
-    let execCount = 0;
-    let providerExecMs = 0;
-    let providerGetMs = 0;
-    const accumulateProviderDurations = (metadata: Record<string, unknown> | undefined): void => {
-      if (!metadata) return;
-      const exec = metadata.durationMs;
-      const get = metadata.getDurationMs;
-      if (typeof exec === "number" && Number.isFinite(exec)) providerExecMs += exec;
-      if (typeof get === "number" && Number.isFinite(get)) providerGetMs += get;
-    };
-
     // The low-cardinality public provider family. A plugin-backed / operator-
     // defined key maps to `plugin`, so a raw unbounded key never rides a span.
     const providerFamily = normalizeProviderFamily(parsed.config.provider);
@@ -232,6 +256,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
       // output reaches the UI mid-run; `streamRunLogs: false` is an explicit
       // opt-out back to batch-at-end delivery.
       streamRunLogs: parsed.config.streamRunLogs !== false,
+      // Interactive ACP output streaming through the persistent session log
+      // stream. Default OFF: the process session bridge keeps the output-file
+      // poll unless an operator opts a sandbox environment in.
+      streamAgentSessionOutput: parsed.config.streamAgentSessionOutput === true,
       runner: input.environmentRuntime && input.lease
         ? {
             // Provider-backed sandbox RPCs do not surface bounded mid-stream
@@ -239,17 +267,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
             // here. The client falls back to the chunked upload path when this is
             // false.
             supportsSingleStreamStdinProgress: false,
-            // Round-trip counter + provider-duration accumulators on the single
-            // host→sandbox exec seam (Open Q1). `measureStartupStep` reads the
-            // per-step delta of each via the `() => number` closures below. The
-            // provider durations ride the exec result's free-form `metadata`
-            // (set by the Daytona plugin), so no protocol/schema change is
-            // needed and providers that omit them simply accumulate nothing.
-            execCount: () => execCount,
-            providerExecMs: () => providerExecMs,
-            providerGetMs: () => providerGetMs,
             execute: async (commandInput) => {
-              execCount += 1;
               // Record true start and stop timestamps around the provider await,
               // so the exec span and the result carry a real wall time.
               const startedAtMs = Date.now();
@@ -274,6 +292,27 @@ export async function resolveEnvironmentExecutionTarget(input: {
                 // provider execution marks the span failed. A later log-callback
                 // rejection sits outside this block and never flips a successful
                 // execution to failed.
+                // Incremental log sink. The provider streams each output chunk
+                // through the execute.log notification while the command runs.
+                // Serialize the delivery per execute call so the runner sees the
+                // chunks in order, and keep the delivered text per stream, so the
+                // final-result delivery below emits only the un-streamed suffix
+                // and can detect a provider poll fallback that returns a
+                // different buffer.
+                let incrementalLogChain: Promise<void> = Promise.resolve();
+                let deliveredStdout = "";
+                let deliveredStderr = "";
+                const onIncrementalLog = (
+                  stream: "stdout" | "stderr",
+                  chunk: string,
+                ): Promise<void> => {
+                  if (stream === "stdout") deliveredStdout += chunk;
+                  else deliveredStderr += chunk;
+                  incrementalLogChain = incrementalLogChain.then(() =>
+                    commandInput.onLog?.(stream, chunk),
+                  );
+                  return incrementalLogChain;
+                };
                 let result;
                 try {
                   result = await input.environmentRuntime!.execute({
@@ -285,6 +324,16 @@ export async function resolveEnvironmentExecutionTarget(input: {
                     env: commandInput.env,
                     stdin: commandInput.stdin,
                     timeoutMs: commandInput.timeoutMs,
+                    onLog: commandInput.onLog ? onIncrementalLog : undefined,
+                    // The ACP process session bridge sets `useSession` so its
+                    // long-lived agent command opens the persistent session and
+                    // streams output, even though it runs with no active step.
+                    forceSession: commandInput.useSession,
+                    // The bridge control-plane execs set `bypassSession` so they
+                    // run one-shot and never queue behind the long-lived agent
+                    // command on the persistent session. An explicit bypass wins
+                    // over `forceSession` and over the active-step selection.
+                    bypassSession: commandInput.bypassSession,
                   });
                 } catch (error) {
                   // The provider execution threw. Mark the span failed with the
@@ -308,7 +357,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
                 const finishedAtMs = Date.now();
                 const finishedAt = new Date(finishedAtMs).toISOString();
                 const durationMs = finishedAtMs - startedAtMs;
-                accumulateProviderDurations(result.metadata);
                 // `setSandboxExecSpanAttributes` sets ONLY the closed
                 // `paperclip.sandbox.startup.exec.*` allowlist: the normalized
                 // provider family, the clamped command label, the numeric exit
@@ -325,17 +373,34 @@ export async function resolveEnvironmentExecutionTarget(input: {
                       waitBeforeMs: toFiniteNumber(result.metadata?.getDurationMs),
                       sandboxMs: toFiniteNumber(result.metadata?.durationMs),
                       criticalPath,
+                      cacheHit: toBoolean(result.metadata?.cacheHit),
                     });
                   } catch {
                     // Observability must not change execution control flow.
                   }
                 }
-                // Deliver the captured output. A rejected `onLog` still
-                // propagates to the caller (control flow is unchanged), but the
-                // span already carries the successful outcome, so a log failure
-                // never marks the execution failed.
-                if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
-                if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);
+                // Drain the ordered incremental delivery before the final
+                // result. The provider streamed chunks arrive as execute.log
+                // notifications while the command runs; awaiting the chain keeps
+                // the runner order and surfaces a log-sink rejection.
+                await incrementalLogChain;
+                // Deliver only the suffix the provider did NOT already stream.
+                // The streamed chunks usually form an in-order prefix of the
+                // final result, so the remaining output is the final text past
+                // the delivered text. When the provider streamed nothing, the
+                // whole output is the suffix. When it streamed the complete
+                // output, the suffix is empty and nothing repeats. When it
+                // streamed a prefix and then fell back to a poll whose buffer
+                // does not continue that prefix, `undeliveredSuffix` returns the
+                // whole final output, so the durable log keeps the complete
+                // result and never holds a truncated slice. A rejected `onLog`
+                // still propagates to the caller (control flow is unchanged),
+                // but the span already carries the successful outcome, so a log
+                // failure never marks the execution failed.
+                const stdoutSuffix = undeliveredSuffix(deliveredStdout, result.stdout ?? "");
+                if (stdoutSuffix) await commandInput.onLog?.("stdout", stdoutSuffix);
+                const stderrSuffix = undeliveredSuffix(deliveredStderr, result.stderr ?? "");
+                if (stderrSuffix) await commandInput.onLog?.("stderr", stderrSuffix);
                 return {
                   exitCode: result.exitCode,
                   signal: result.signal ?? null,

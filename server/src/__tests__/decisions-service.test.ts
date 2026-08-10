@@ -532,6 +532,7 @@ describePg("decisionService", () => {
   it("expires TTL and target-gone decisions and wakes the origin agent", async () => {
     const ttl = await createCommentDecision("lenient", { expiresAt: nearFutureExpiry() });
     const gone = await createCommentDecision("strict", { idempotencyKey: "gone" });
+    await db.update(decisions).set({ expiresAt: new Date(0) }).where(eq(decisions.id, ttl.id));
     await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, targetIssueId));
     await expireDecisionNow(ttl.id);
     expect((await service().sweepExpired()).expired).toBe(2);
@@ -539,6 +540,61 @@ describePg("decisionService", () => {
     expect(rows.find((row) => row.id === ttl.id)?.metadata).toMatchObject({ expiredReason: "ttl" });
     expect(rows.find((row) => row.id === gone.id)?.metadata).toMatchObject({ expiredReason: "target_gone" });
     expect(wakes).toHaveLength(2);
+  });
+
+  it("expires strict decisions whose targets completed after they were proposed", async () => {
+    const completed = await createCommentDecision("strict", { idempotencyKey: "target-completed" });
+    const lenient = await createCommentDecision("lenient", { idempotencyKey: "lenient-survives" });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, targetIssueId));
+
+    expect((await service().sweepExpired()).expired).toBe(1);
+
+    expect((await service().get(completed.id))?.metadata).toMatchObject({ expiredReason: "target_completed" });
+    expect((await service().get(lenient.id))?.status).toBe("open");
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: completed.id, outcome: "expired" }]);
+  });
+
+  it("keeps strict decisions that intentionally target an already-done issue", async () => {
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, targetIssueId));
+    const reopen = await createCommentDecision("strict", { idempotencyKey: "already-done" });
+
+    expect((await service().sweepExpired()).expired).toBe(0);
+    expect((await service().get(reopen.id))?.status).toBe("open");
+  });
+
+  it("expires when a strict secondary target completes after proposal", async () => {
+    const blockerId = randomUUID();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, targetIssueId));
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Secondary blocker",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: decidedByUserId,
+    });
+    const created = await service().create({
+      companyId,
+      actor: agentActor(),
+      agentId,
+      runId,
+      title: "Create follow-up?",
+      body: "Body",
+      options: [{
+        id: "yes",
+        label: "Yes",
+        effects: [{
+          type: "create_issue",
+          targetIssueId,
+          staleness: "strict",
+          draft: { title: "Follow-up", blockedByIssueIds: [blockerId] },
+        }],
+      }],
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+
+    expect((await service().sweepExpired()).expired).toBe(1);
+    expect((await service().get(created.id))?.metadata).toMatchObject({ expiredReason: "target_completed" });
   });
 
   it("groups rule-key stats and separates explicit dismissals from expiry", async () => {
