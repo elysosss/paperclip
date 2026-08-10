@@ -1,5 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
-import { PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
+import { OUTBOX_DRAIN_JOB, PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -17,10 +17,20 @@ const manifest: PaperclipPluginManifestV1 = {
     "plugin.state.write",
     "http.outbound",
     "secrets.read-ref",
+    "jobs.schedule",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
   },
+  jobs: [
+    {
+      jobKey: OUTBOX_DRAIN_JOB,
+      displayName: "Resolve interrupted mirrors",
+      description:
+        "Closes create records left open by an interrupted mirror, and marks the ones that cannot be confirmed. Reads plugin state only — it never calls GitHub.",
+      schedule: "*/5 * * * *",
+    },
+  ],
   instanceConfigSchema: {
     type: "object",
     properties: {

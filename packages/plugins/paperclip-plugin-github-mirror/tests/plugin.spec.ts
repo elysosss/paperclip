@@ -1,11 +1,16 @@
-import { describe, expect, it } from "vitest";
-import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
+import { describe, expect, it, vi } from "vitest";
+import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { Issue } from "@paperclipai/shared";
 import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
 import { GithubApiError, GithubClient, parseRepository } from "../src/github.js";
 import { formatBody, formatTitle, githubStateFor, statusLabel } from "../src/mirror.js";
-import { STATE_KEYS } from "../src/constants.js";
+import {
+  OUTBOX_DRAIN_JOB,
+  OUTBOX_ENTITY_TYPE,
+  OUTBOX_STATUS,
+  STATE_KEYS,
+} from "../src/constants.js";
 
 const COMPANY_ID = "c_1";
 
@@ -42,8 +47,23 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
 
 type HttpFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
-/** Records every outbound call and answers with a canned GitHub response. */
-function stubFetch() {
+function okResponse() {
+  return new Response(JSON.stringify({ number: 77, html_url: "https://github.com/o/r/issues/77" }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** A canned failure, as GitHub would send it. */
+function errorResponse(status: number, headers: Record<string, string> = {}) {
+  return () => new Response("nope", { status, headers });
+}
+
+/**
+ * Records every outbound call. Answers from `queue` while it lasts, then with a
+ * successful create — so a test only has to spell out the failures it cares about.
+ */
+function stubFetch(queue: Array<() => Response> = []) {
   const calls: Array<{ url: string; method: string; body: unknown; headers: Record<string, string> }> = [];
   const impl = async (url: string, init?: RequestInit): Promise<Response> => {
     const headers = (init?.headers ?? {}) as Record<string, string>;
@@ -53,15 +73,56 @@ function stubFetch() {
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
       headers,
     });
-    return new Response(JSON.stringify({ number: 77, html_url: "https://github.com/o/r/issues/77" }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    const next = queue.shift();
+    return next ? next() : okResponse();
   };
   return { calls, impl };
 }
 
-async function setupHarness(config: Record<string, unknown> = {}) {
+/**
+ * Drives a promise that sleeps between retries without spending the backoff in
+ * real time. Only `setTimeout` is faked: the retry budget reads `Date.now()`,
+ * and faking that too would make every attempt look instantaneous.
+ */
+async function withoutBackoffDelays<T>(start: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ["setTimeout"] });
+  try {
+    const promise = start();
+    let settled = false;
+    // Marks completion without producing a second promise: a rejecting one
+    // would be reported as unhandled before the loop below reaches its `await`.
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // Each pass flushes microtasks and fires any backoff timer that is now due.
+    for (let i = 0; i < 20 && !settled; i += 1) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    return await promise;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** The create record the outbox keeps for a Paperclip issue, if any. */
+async function outboxRecord(harness: TestHarness, issueId = "iss_1") {
+  const [record] = await harness.ctx.entities.list({
+    entityType: OUTBOX_ENTITY_TYPE,
+    externalId: `${COMPANY_ID}:${issueId}`,
+    limit: 1,
+  });
+  return record ?? null;
+}
+
+async function setupHarness(
+  config: Record<string, unknown> = {},
+  responses: Array<() => Response> = [],
+) {
   const harness = createTestHarness({
     manifest,
     capabilities: [...manifest.capabilities, "events.emit"],
@@ -72,7 +133,7 @@ async function setupHarness(config: Record<string, unknown> = {}) {
       ...config,
     },
   });
-  const fetcher = stubFetch();
+  const fetcher = stubFetch(responses);
   // The harness performs a real network fetch by default — replace it so the
   // suite stays offline and can assert on the exact requests.
   harness.ctx.http.fetch = fetcher.impl as HttpFetch;
@@ -146,12 +207,53 @@ describe("github client", () => {
         fetchImpl: async () => new Response("nope", { status, headers }),
       });
 
-    await expect(make(429).addComment(1, "x")).rejects.toMatchObject({ retryable: true });
     await expect(
-      make(403, { "x-ratelimit-remaining": "0" }).addComment(1, "x"),
+      withoutBackoffDelays(() => make(429).addComment(1, "x")),
+    ).rejects.toMatchObject({ retryable: true });
+    await expect(
+      withoutBackoffDelays(() => make(403, { "x-ratelimit-remaining": "0" }).addComment(1, "x")),
     ).rejects.toMatchObject({ retryable: true });
     await expect(make(422).addComment(1, "x")).rejects.toBeInstanceOf(GithubApiError);
     await expect(make(422).addComment(1, "x")).rejects.toMatchObject({ retryable: false });
+  });
+
+  it("reads the wait GitHub asks for, and ignores one it cannot use", async () => {
+    const make = (status: number, headers: Record<string, string>) =>
+      new GithubClient({
+        repository: "acme/content",
+        token: "t",
+        fetchImpl: async () => new Response("nope", { status, headers }),
+      });
+
+    // `retry-after` is in seconds.
+    await expect(
+      withoutBackoffDelays(() => make(429, { "retry-after": "2" }).addComment(1, "x")),
+    ).rejects.toMatchObject({ retryAfterMs: 2000 });
+    // `x-ratelimit-reset` is an epoch timestamp; one in the past says nothing.
+    await expect(
+      withoutBackoffDelays(() => make(429, { "x-ratelimit-reset": "1" }).addComment(1, "x")),
+    ).rejects.toMatchObject({ retryAfterMs: null });
+  });
+
+  it("retries a worker→host call that timed out without an answer", async () => {
+    // The SDK drops `signal` when it serializes `init`, so the plugin cannot
+    // bound the call itself; a timeout arrives as a rejection like this one.
+    let attempts = 0;
+    const client = new GithubClient({
+      repository: "acme/content",
+      token: "t",
+      fetchImpl: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error('Worker→host call "http.fetch" timed out after 30000ms');
+        }
+        return okResponse();
+      },
+    });
+
+    await withoutBackoffDelays(() => client.addComment(1, "x"));
+
+    expect(attempts).toBe(2);
   });
 });
 
@@ -246,7 +348,9 @@ describe("mirror behaviour", () => {
     await plugin.definition.setup(harness.ctx);
 
     await expect(
-      harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+      withoutBackoffDelays(() =>
+        harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+      ),
     ).resolves.not.toThrow();
 
     expect(harness.logs.some((l) => l.level === "error")).toBe(true);
@@ -328,6 +432,155 @@ describe("mirror behaviour", () => {
     );
 
     expect(fetcher.calls.length).toBe(before);
+  });
+
+  it("retries a 502 and still ends up with exactly one GitHub issue", async () => {
+    const { harness, fetcher } = await setupHarness({}, [errorResponse(502)]);
+
+    await withoutBackoffDelays(() =>
+      harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+    );
+
+    expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(2);
+    expect(
+      harness.getState({ scopeKind: "issue", scopeId: "iss_1", stateKey: STATE_KEYS.mirroredNumber }),
+    ).toBe(77);
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.done);
+  });
+
+  it("does not retry a request GitHub rejected outright", async () => {
+    // A 422 fails identically on the second attempt; retrying only wastes the
+    // handler's budget.
+    const { harness, fetcher } = await setupHarness({}, [
+      errorResponse(422),
+      errorResponse(422),
+      errorResponse(422),
+    ]);
+
+    await withoutBackoffDelays(() =>
+      harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+    );
+
+    expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("gives up after three attempts and leaves the create recorded", async () => {
+    const { harness, fetcher } = await setupHarness({}, [
+      errorResponse(429),
+      errorResponse(429),
+      errorResponse(429),
+      errorResponse(429),
+    ]);
+
+    await withoutBackoffDelays(() =>
+      harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+    );
+
+    expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(3);
+    // Nothing was created, but the attempt is on the record rather than lost.
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.pending);
+    expect(
+      harness.getState({ scopeKind: "issue", scopeId: "iss_1", stateKey: STATE_KEYS.mirroredNumber }),
+    ).toBeFalsy();
+  });
+
+  it("refuses a second create when the first one's outcome was lost", async () => {
+    // The crash window: GitHub accepted the issue, then the state write died.
+    // Nothing on this side knows the number, and the mirror will not go and ask.
+    const { harness, fetcher } = await setupHarness();
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let failed = false;
+    harness.ctx.state.set = async (input, value) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("state write lost");
+      }
+      return realSet(input, value);
+    };
+
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+
+    expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.uncertain);
+    expect(
+      harness.logs.some((l) => l.level === "error" && l.message.includes("refusing to create")),
+    ).toBe(true);
+
+    // The drain does not try to resolve it either: the mirror is write-only, so
+    // asking GitHub what happened is not an option it has.
+    const callsBeforeDrain = fetcher.calls.length;
+    await harness.runJob(OUTBOX_DRAIN_JOB);
+
+    expect(fetcher.calls).toHaveLength(callsBeforeDrain);
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.uncertain);
+  });
+
+  it("closes a create whose record was never closed, without calling GitHub", async () => {
+    // The other half of the same window: the number reached state, the record
+    // did not. That one is knowable from plugin-local state alone.
+    const { harness, fetcher } = await setupHarness();
+    const realUpsert = harness.ctx.entities.upsert.bind(harness.ctx.entities);
+    let upserts = 0;
+    harness.ctx.entities.upsert = async (input) => {
+      upserts += 1;
+      if (upserts === 2) throw new Error("entity write lost");
+      return realUpsert(input);
+    };
+
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+
+    expect(
+      harness.getState({ scopeKind: "issue", scopeId: "iss_1", stateKey: STATE_KEYS.mirroredNumber }),
+    ).toBe(77);
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.pending);
+
+    const callsBeforeDrain = fetcher.calls.length;
+    await harness.runJob(OUTBOX_DRAIN_JOB);
+
+    expect(fetcher.calls).toHaveLength(callsBeforeDrain);
+    const record = await outboxRecord(harness);
+    expect(record?.status).toBe(OUTBOX_STATUS.done);
+    expect(record?.data).toMatchObject({ mirroredNumber: 77 });
+  });
+
+  it("records a stale unfinished create as uncertain rather than retrying it", async () => {
+    const { harness, fetcher } = await setupHarness();
+    const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    await harness.ctx.entities.upsert({
+      entityType: OUTBOX_ENTITY_TYPE,
+      scopeKind: "issue",
+      scopeId: "iss_9",
+      externalId: `${COMPANY_ID}:iss_9`,
+      status: OUTBOX_STATUS.pending,
+      data: { companyId: COMPANY_ID, issueId: "iss_9", startedAt: stale },
+    });
+
+    await harness.runJob(OUTBOX_DRAIN_JOB);
+
+    expect((await outboxRecord(harness, "iss_9"))?.status).toBe(OUTBOX_STATUS.uncertain);
+    expect(fetcher.calls).toHaveLength(0);
+    expect(
+      harness.logs.some((l) => l.level === "error" && l.message.includes("cannot be confirmed")),
+    ).toBe(true);
+  });
+
+  it("leaves a create that is still in flight alone", async () => {
+    // The drain runs on a schedule and must not condemn a create that simply
+    // has not come back yet.
+    const { harness } = await setupHarness();
+    await harness.ctx.entities.upsert({
+      entityType: OUTBOX_ENTITY_TYPE,
+      scopeKind: "issue",
+      scopeId: "iss_9",
+      externalId: `${COMPANY_ID}:iss_9`,
+      status: OUTBOX_STATUS.pending,
+      data: { companyId: COMPANY_ID, issueId: "iss_9", startedAt: new Date().toISOString() },
+    });
+
+    await harness.runJob(OUTBOX_DRAIN_JOB);
+
+    expect((await outboxRecord(harness, "iss_9"))?.status).toBe(OUTBOX_STATUS.pending);
   });
 
   it("reports a budget stop as a pause, not a failure", async () => {
