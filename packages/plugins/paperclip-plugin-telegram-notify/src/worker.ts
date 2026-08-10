@@ -12,6 +12,7 @@ import {
   formatEscalation,
   formatRunFailure,
   formatWaitingForHuman,
+  formatWaitingForInteraction,
   type IssueRef,
 } from "./format.js";
 import { TelegramApiError, TelegramClient } from "./telegram.js";
@@ -75,8 +76,36 @@ function num(raw: Record<string, unknown>, key: string): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+/** The token the board-status path claims a hand-off with. */
+const STATUS_HANDOFF = "status:blocked";
+
 const plugin = definePlugin({
   async setup(ctx) {
+    const waitingKey = (issueId: string) => ({
+      scopeKind: "issue" as const,
+      scopeId: issueId,
+      stateKey: STATE_KEYS.waitingNotified,
+    });
+
+    /**
+     * Takes the issue's single "already told them" slot, or reports that some
+     * other signal holds it. Both hand-off paths go through here, which is what
+     * stops one hand-off — an interaction opened, and the task parked because of
+     * it — from buzzing the phone twice.
+     */
+    const claimHandoff = async (issueId: string, token: string): Promise<boolean> => {
+      const held = await ctx.state.get(waitingKey(issueId));
+      if (typeof held === "string" && held.length > 0) return false;
+      await ctx.state.set(waitingKey(issueId), token);
+      return true;
+    };
+
+    /** Releases the slot, but only for the signal that took it. */
+    const releaseHandoff = async (issueId: string, token: string): Promise<void> => {
+      if ((await ctx.state.get(waitingKey(issueId))) !== token) return;
+      await ctx.state.delete(waitingKey(issueId));
+    };
+
     /**
      * Sends to every allowlisted chat. One failing recipient must not silence
      * the others, so each send is guarded on its own — the alternative loses
@@ -251,7 +280,15 @@ const plugin = definePlugin({
         const seen = await ctx.state.get({ ...scope, stateKey: STATE_KEYS.lastStatus });
         const previous = typeof seen === "string" ? seen : null;
         await ctx.state.set({ ...scope, stateKey: STATE_KEYS.lastStatus }, issue.status);
-        if (issue.status !== WAITING_STATUS || previous === WAITING_STATUS) return;
+        if (issue.status !== WAITING_STATUS) {
+          // Off the parked status is where this path's hand-off ends.
+          await releaseHandoff(issueId, STATUS_HANDOFF);
+          return;
+        }
+        if (previous === WAITING_STATUS) return;
+        // An interaction on this task already said "waiting for you" — the
+        // parking is the same hand-off arriving by its other signal.
+        if (!(await claimHandoff(issueId, STATUS_HANDOFF))) return;
 
         const descriptor = issue.unblockDescriptor as
           | { owner?: unknown; action?: unknown }
@@ -279,6 +316,66 @@ const plugin = definePlugin({
           }),
           issueId,
         );
+      }),
+    );
+
+    /**
+     * The hand-off the board state cannot show. An agent that needs a person to
+     * decide something is not allowed to park the task and name that person as
+     * the unblock owner — naming anyone but itself is a 403 — so it opens an
+     * issue-thread interaction and stops. The task stays in its current status,
+     * so the `issue.updated` path above never fires, and before this handler the
+     * terminal state of a maintenance loop reached no surface at all.
+     */
+    ctx.events.on("issue.interaction.created", (event) =>
+      guard(ctx, "issue.interaction.created", async () => {
+        const issueId = event.entityId;
+        if (!issueId) return;
+        const config = await readConfig(ctx, event.companyId);
+        if (!config?.notify.waitingForHuman) return;
+
+        const raw = payloadOf(event);
+        // Addressed to an agent means the agent loop answers it; a phone has
+        // nothing to do with it. Only an unaddressed pending interaction is a
+        // hand-off to a human.
+        if (str(raw, "addresseeAgentId")) return;
+        if (str(raw, "interactionStatus") !== "pending") return;
+        const interactionId = str(raw, "interactionId");
+        if (!interactionId) return;
+        if (!(await claimHandoff(issueId, `interaction:${interactionId}`))) return;
+
+        const issue = await lookupIssue(ctx, issueId, event.companyId);
+        await broadcast(
+          config,
+          event.companyId,
+          "waiting-for-human",
+          formatWaitingForInteraction({
+            issue,
+            issueId,
+            kind: str(raw, "interactionKind"),
+            link: boardLink(config.boardBaseUrl, issue ?? { id: issueId, key: null, title: null }),
+          }),
+          issueId,
+        );
+      }),
+    );
+
+    /**
+     * Answered, rejected, withdrawn, expired — the wait is over, so the slot is
+     * free for the next hand-off on this task. Deliberately not gated on the
+     * config toggle: state has to stay honest even while messages are switched
+     * off, or turning them back on finds a claim nothing will ever release.
+     */
+    ctx.events.on("issue.interaction.resolved", (event) =>
+      guard(ctx, "issue.interaction.resolved", async () => {
+        const issueId = event.entityId;
+        if (!issueId) return;
+        const raw = payloadOf(event);
+        const interactionId = str(raw, "interactionId");
+        // A partial verdict submission resolves some items and leaves the
+        // interaction pending. Nobody is off the hook yet.
+        if (!interactionId || str(raw, "interactionStatus") === "pending") return;
+        await releaseHandoff(issueId, `interaction:${interactionId}`);
       }),
     );
 

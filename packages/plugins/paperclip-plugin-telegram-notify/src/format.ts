@@ -132,3 +132,31 @@ export function formatWaitingForHuman(input: {
   lines.push(input.action ? escapeHtml(clip(input.action, 200)) : "No unblock action was recorded.");
   return withLink(lines, input.link);
 }
+
+/**
+ * The other half of the same hand-off. An agent that wants a person to decide
+ * something cannot park the task and name that person as the unblock owner —
+ * the board refuses an agent naming anyone but itself — so it opens an
+ * issue-thread interaction instead and stops. That is the ending of most
+ * maintenance loops, and until this message it produced no notification at all.
+ *
+ * The kind is an enum, not the question. What was actually asked stays on the
+ * board, same rule as everywhere else in this file.
+ */
+const INTERACTION_ASKS: Record<string, string> = {
+  request_confirmation: "An agent is waiting for you to confirm something.",
+  request_checkbox_confirmation: "An agent is waiting for you to confirm something.",
+  ask_user_questions: "An agent asked you a question.",
+  request_item_verdicts: "An agent is waiting for your verdict on a list of items.",
+  suggest_tasks: "An agent suggested tasks for you to accept or reject.",
+};
+
+export function formatWaitingForInteraction(input: {
+  issue: IssueRef | null;
+  issueId: string | null;
+  kind: string | null;
+  link: string | null;
+}): string {
+  const ask = (input.kind ? INTERACTION_ASKS[input.kind] : null) ?? "An agent is waiting on you.";
+  return withLink(["<b>Waiting for you</b>", issueLabel(input.issue, input.issueId), ask], input.link);
+}

@@ -122,6 +122,7 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `issue.created`, `issue.updated`, `issue.comment.created` | issue |
 | `issue.document.created`, `issue.document.updated`, `issue.document.deleted` | issue |
 | `issue.relations.updated`, `issue.checked_out`, `issue.released`, `issue.assignment_wakeup_requested` | issue |
+| `issue.interaction.created`, `issue.interaction.resolved` | issue |
 | `agent.created`, `agent.updated`, `agent.status_changed` | agent |
 | `agent.run.started`, `agent.run.finished`, `agent.run.failed`, `agent.run.cancelled` | run |
 | `goal.created`, `goal.updated` | goal |

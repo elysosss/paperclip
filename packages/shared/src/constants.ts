@@ -1621,6 +1621,8 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.checked_out",
   "issue.released",
   "issue.assignment_wakeup_requested",
+  "issue.interaction.created",
+  "issue.interaction.resolved",
   "agent.created",
   "agent.updated",
   "agent.status_changed",
