@@ -31,11 +31,23 @@ export const OUTBOX_DRAIN_JOB = "drain-mirror-outbox";
  * not have reached GitHub and we have no way to find out — the mirror is
  * write-only, so it will not go and look. Refusing forever turns what used to
  * be a silent duplicate issue into one recorded fact a human can act on.
+ *
+ * `failed` is the case `uncertain` must not swallow. When GitHub answers with a
+ * status code — a 500, or a 429 that outlived the retry budget — the create
+ * definitively did not happen, so there is nothing to be uncertain about and no
+ * duplicate to fear. Those records stay retryable: a later event creates the
+ * issue. Collapsing them into `uncertain` would refuse forever on the strength
+ * of an answer that said "no", which is worse than the behaviour this file
+ * replaced, where a failed create was simply retried on the next event.
+ *
+ * The distinction is exactly whether GitHub replied. It did — `failed`. We
+ * never found out — `pending`, and `uncertain` once the grace window passes.
  */
 export const OUTBOX_STATUS = {
   pending: "pending",
   done: "done",
   uncertain: "uncertain",
+  failed: "failed",
 } as const;
 
 /**

@@ -142,6 +142,20 @@ export async function recordMirrored(
 }
 
 /**
+ * GitHub answered with a status code, so the create definitively did not
+ * happen. Terminal for this attempt but not for the task: a later event is
+ * free to create the issue, because there is no duplicate to fear.
+ */
+export async function recordFailed(
+  ctx: PluginContext,
+  record: PluginEntityRecord,
+): Promise<void> {
+  const data = readData(record);
+  if (!data) return;
+  await write(ctx, data, OUTBOX_STATUS.failed, record.title ?? undefined);
+}
+
+/**
  * Terminal. The create may or may not exist on GitHub; finding out would mean
  * reading GitHub back, which this plugin does not do.
  */
