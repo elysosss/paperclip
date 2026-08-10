@@ -42,6 +42,11 @@ COPY --parents packages/plugins/sandbox-providers/./*/package.json packages/plug
 COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugins/paperclip-plugin-fake-sandbox/
 COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-wiki/
 COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
+# Fork plugins.
+COPY packages/plugins/paperclip-plugin-escalation/package.json packages/plugins/paperclip-plugin-escalation/
+COPY packages/plugins/paperclip-plugin-github-mirror/package.json packages/plugins/paperclip-plugin-github-mirror/
+COPY packages/plugins/paperclip-plugin-run-completion/package.json packages/plugins/paperclip-plugin-run-completion/
+COPY packages/plugins/paperclip-plugin-telegram-notify/package.json packages/plugins/paperclip-plugin-telegram-notify/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
