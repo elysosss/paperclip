@@ -15,6 +15,11 @@ permissions:
 
 jobs:
   review:
+    # Upstream's review bot, and only upstream can run it. Dependency Review needs
+    # Advanced Security, which a private fork does not have, and the token step needs
+    # `COMMITPERCLIP_KEY` — upstream's GitHub App, not a secret a fork can hold. On the
+    # fork this job could only ever fail, so it is scoped to the repository that owns it.
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
