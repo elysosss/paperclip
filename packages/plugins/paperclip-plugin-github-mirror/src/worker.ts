@@ -20,6 +20,7 @@ import {
   issueScope,
   readMirroredNumber,
   recordIntent,
+  recordFailed,
   recordMirrored,
   recordUncertain,
 } from "./outbox.js";
@@ -124,7 +125,7 @@ const plugin = definePlugin({
         // may already have created the issue. Posting again would duplicate it,
         // and the mirror will not read GitHub back to find out which it is.
         const attempted = await findCreateRecord(ctx, event.companyId, issueId);
-        if (attempted) {
+        if (attempted && attempted.status !== OUTBOX_STATUS.failed) {
           if (attempted.status === OUTBOX_STATUS.pending) {
             await recordUncertain(ctx, attempted);
             ctx.logger.error(
@@ -134,6 +135,8 @@ const plugin = definePlugin({
           }
           return;
         }
+        // A `failed` record falls through on purpose: GitHub answered, so the
+        // issue does not exist and creating it now cannot duplicate anything.
 
         const issue = await ctx.issues.get(issueId, event.companyId);
         if (!issue) return;
@@ -141,11 +144,20 @@ const plugin = definePlugin({
         const intent = await recordIntent(ctx, event.companyId, issueId, formatTitle(issue));
 
         const github = await clientFor(ctx, event.companyId, config);
-        const created = await github.createIssue({
-          title: formatTitle(issue),
-          body: formatBody(issue),
-          labels: [statusLabel(issue.status)],
-        });
+        let created;
+        try {
+          created = await github.createIssue({
+            title: formatTitle(issue),
+            body: formatBody(issue),
+            labels: [statusLabel(issue.status)],
+          });
+        } catch (error) {
+          // Only a reply from GitHub proves nothing was created. Anything else —
+          // a timeout, a dead socket — leaves the outcome unknown, so the record
+          // stays `pending` for the drain to condemn.
+          if (error instanceof GithubApiError) await recordFailed(ctx, intent);
+          throw error;
+        }
 
         // State first: it is what every later handler reads. The outbox record
         // is closed after, and the drain repairs the gap if we die in between.

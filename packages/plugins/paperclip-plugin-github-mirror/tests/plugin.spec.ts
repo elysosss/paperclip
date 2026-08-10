@@ -477,11 +477,53 @@ describe("mirror behaviour", () => {
     );
 
     expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(3);
-    // Nothing was created, but the attempt is on the record rather than lost.
-    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.pending);
+    // GitHub answered every time, so nothing was created and we know it. The
+    // record says `failed`, not `pending`: there is nothing to be uncertain
+    // about, and the drain must not condemn it.
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.failed);
     expect(
       harness.getState({ scopeKind: "issue", scopeId: "iss_1", stateKey: STATE_KEYS.mirroredNumber }),
     ).toBeFalsy();
+  });
+
+  it("creates the issue on a later event after GitHub refused the first attempt", async () => {
+    // The regression this guards: treating an exhausted retry the same as a lost
+    // outcome would refuse forever, and the task would never be mirrored at all —
+    // strictly worse than the behaviour before the outbox existed, where a failed
+    // create was simply retried on the next event.
+    const { harness, fetcher } = await setupHarness({}, [
+      errorResponse(429),
+      errorResponse(429),
+      errorResponse(429),
+    ]);
+
+    await withoutBackoffDelays(() =>
+      harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+    );
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.failed);
+
+    await harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID });
+
+    expect(fetcher.calls.filter((c) => c.method === "POST")).toHaveLength(4);
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.done);
+    expect(
+      harness.getState({ scopeKind: "issue", scopeId: "iss_1", stateKey: STATE_KEYS.mirroredNumber }),
+    ).toBe(77);
+  });
+
+  it("leaves a lost outcome pending even though a refusal would be failed", async () => {
+    // Same handler, opposite evidence: no reply from GitHub means the create may
+    // have landed, so this one must stay `pending` for the drain.
+    const { harness } = await setupHarness({}, []);
+    harness.ctx.http.fetch = (async () => {
+      throw new Error("worker→host call timed out after 30000ms");
+    }) as typeof harness.ctx.http.fetch;
+
+    await withoutBackoffDelays(() =>
+      harness.emit("issue.created", {}, { entityId: "iss_1", companyId: COMPANY_ID }),
+    );
+
+    expect((await outboxRecord(harness))?.status).toBe(OUTBOX_STATUS.pending);
   });
 
   it("refuses a second create when the first one's outcome was lost", async () => {
