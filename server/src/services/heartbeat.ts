@@ -13303,6 +13303,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       await startNextQueuedRunForAgent(run.agentId);
+      // Reaping frees the company slot the dead run held, and the agent waiting
+      // on it is a different one. Same reason as the completion path.
+      await startNextQueuedRunsForCompanyPeers(run.companyId, run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -18622,6 +18625,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
     await startNextQueuedRunForAgent(run.agentId);
+    // Cancelling frees the company slot too, and the agent that lost the race for
+    // it is a different one. Same reason as the completion path.
+    await startNextQueuedRunsForCompanyPeers(run.companyId, run.agentId);
     return cancelled;
   }
 
