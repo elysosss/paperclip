@@ -70,7 +70,12 @@ import {
 import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext } from "../instrumentation.js";
 import { logger } from "../middleware/logger.js";
-import { companyHasFreeWipSlot, normalizeCompanyWipLimit } from "./company-wip-limit.js";
+import {
+  companyHasFreeWipSlot,
+  isCompanyWipLimitEnabled,
+  normalizeCompanyWipLimit,
+  withCompanyWipSlot,
+} from "./company-wip-limit.js";
 import {
   createGitRemoteAuthProvider,
   describeGitAuthFailure,
@@ -12483,17 +12488,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    // The company-wide slot is reserved here, not at the earlier count: the check
+    // at startNextQueuedRunForAgent is a fast path, and ~11 round trips separate
+    // it from this UPDATE. withCompanyWipSlot re-counts under a per-company
+    // advisory lock and returns null when the company is full, leaving the run
+    // queued. Disabled limit => no transaction, plain `db`. See company-wip-limit.ts.
+    const claimed = await withCompanyWipSlot(
+      { db, companyId: run.companyId, limit: companyMaxConcurrentRuns },
+      (tx) =>
+        tx
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            responsibleUserId,
+            startedAt: run.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null),
+    );
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -13536,6 +13550,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       return claimedRuns;
     });
+  }
+
+  // Company-wide follow-up dispatch, run when a run finishes.
+  //
+  // The company WIP slot is a reservation taken in claimQueuedRun, so the agent
+  // that loses the race keeps its run `queued`. Every completion path re-dispatches
+  // only the finishing agent (startNextQueuedRunForAgent), and the loser is by
+  // definition a *different* agent — without this sweep the freed slot would sit
+  // idle until the next resumeQueuedRuns timer tick, turning an over-spend bug into
+  // a latency bug. Sweeps the company's other agents that still have queued runs.
+  //
+  // No-op unless a company limit is configured, so upstream scheduling is untouched.
+  async function startNextQueuedRunsForCompanyPeers(companyId: string, finishedAgentId: string) {
+    if (!isCompanyWipLimitEnabled(companyMaxConcurrentRuns)) return;
+    if ((await getSchedulingSuppression()).suppressed) return;
+    const cutoff = await getWorktreeExecutionCutoff();
+
+    const queuedRuns = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.status, "queued"),
+        ne(heartbeatRuns.agentId, finishedAgentId),
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+      ));
+
+    for (const agentId of [...new Set(queuedRuns.map((row) => row.agentId))]) {
+      await startNextQueuedRunForAgent(agentId);
+    }
   }
 
   // Await every background heartbeat execution that is currently in flight. A
@@ -16384,6 +16428,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
+          await startNextQueuedRunsForCompanyPeers(run.companyId, run.agentId);
         }
   }
 
